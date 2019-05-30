@@ -1,0 +1,3231 @@
+---
+title: "scRNASeq workflow - Vignette"
+author: "Rebekka Wegmann"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+output: 
+  html_document:
+    toc: true
+---
+
+## LICENSE
+Copyright 2018 Novartis Institutes for BioMedical Research Inc.
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+
+## Setting up your environment
+### System requirements
+Some of the bioconductor packages used in this workflow changed drastically between different versions, so that newer versions are no longer compatible with tho old ones. Therfore, please make sure your **R version is 3.4.1** and your **Bioconductor version is 3.5**.
+
+```{r, eval = F}
+source("https://bioconductor.org/biocLite.R")
+
+# to install a specific version of bioconductor, use this instead:
+install.packages("BiocInstaller", repos="http://bioconductor.org/packages/3.5/bioc")
+library(BiocInstaller)
+```
+
+Some packages depend on `Rcpp` and `RcppArmadillo`, which require relatively recent versions of C/C++ compilers. This should in general not be an issue, but keep it in mind if you stumble upon errors involving those packages or any other C/C++ compilation related errors.
+
+Lastly, installing packages from github requires the devtools package:
+
+```{r, eval = F}
+install.packages("devtools")
+```
+
+### Required packages
+In this section, all packages needed to run this vignette are listed in the order that they are loaded. Note that because sometimes, major changes happen between diffrent versions of a package, make sure you are installing the versions provided below.
+
+#### Packages that are required throughout the analysis
+```{r, eval=F}
+# from CRAN
+install.packages("Rtsne") #Rtsne v. 0.13
+install.packages("ggplot2") # ggplot2 v. 2.2.1
+install.packages("data.table") # data.table v. 1.10.4
+install.packages("RColorBrewer") # RColorBrewer v. 1.1-2
+install.packages("mvoutlier") # mvoutlier 2.0.8, required by some functions from scater
+
+devtools::install_github("bwlewis/irlba") # irlba 2.3.2, optional. Make sure you use irlba > 2.3.1, older versions contain a bug that results in unreliable output!
+
+# rom Bioconductor
+biocLite("scater") # scater v. 1.4.0
+biocLite("scran") # scran v. 1.4.5
+```
+
+#### Genome annotation (human)
+```{r, eval=F}
+# ensembldb 2.0.4 and EnsDb.Hsapiens.v79 2.1.0
+biocLite(c("ensembldb","EnsDb.Hsapiens.v79"))
+# org.Hs.eg.db v. 3.4.1
+biocLite("org.Hs.eg.db")
+```
+
+#### Genome annotation (mouse)
+```{r, eval=F}
+# ensembldb 2.0.4 and EnsDb.Mmusculus 2.1.0
+biocLite(c("ensembldb","EnsDb.Mmusculus.v75"))
+# org.Mm.eg.db v. 3.4.1
+biocLite("org.Mm.eg.db")
+```
+
+#### Feature selection
+```{r,eval = F}
+# M3Drop version 3.05.00 (Note: This is still under active development, please let me know if a new version breaks my functions...)
+devtools::install_github("tallulandrews/M3D")
+```
+
+#### Clustering
+```{r, eval = F}
+install.packages("cluster") # cluster v. 2.0.6
+install.packages("dendextend") # dendextend v. 1.5.2
+install.packages("Ckmeans.1d.dp") # Ckmeans.1d.dp v. 4.2.1
+install.packages("dbscan") # DBSCAN v. 1.1-1
+install.packages(c("mclust","mvtnorm")) # mclust v. 5.4 and mvtnorm 1.0.6
+install.packages("dynamicTreeCut") # dynamicTreeCut v. 1.63-1 
+
+biocLite("SC3") # SC3 v. 1.4.2
+devtools::install_github("satijalab/seurat") #Seurat 2.0.1
+devtools::install_github('JustinaZ/pcaReduce') #pcaReduce 1.68.0
+```
+
+In addition, an external installation of MCL is required which can be found [here](https://micans.org/mcl/).
+
+#### Differential expression analysis
+```{r,eval = F}
+biocLite("limma") # limma v. 3.32.5
+biocLite("MAST") # MAST v. 1.2.1
+```
+
+
+### Setting up paths for loading and saving data
+
+**Note: You have to change these so that they match your directories!**
+
+This example assumes your working directory is the scRNASeq_workflow/vignettes directory, thus `wd` is the path to the scRNASeq_workflow directory.
+
+```{r, message = FALSE}
+rm(list=ls())
+graphics.off()
+
+wd = ".."
+
+#Directory where input files are stored
+input_dir = file.path(wd,"example_data")
+
+#Directory where code is stored
+code_dir = file.path(wd,"code")
+
+#where to save the output data?
+out_data_dir = file.path(wd,"example_output")
+if(!dir.exists(out_data_dir)) {dir.create(out_data_dir)}
+
+#where to save the produced plots?
+plotdir = file.path(wd,"example_plots")
+if(!dir.exists(plotdir)) {dir.create(plotdir)}
+
+set.seed(17) #to make tSNE plots reproducible
+
+source(file.path(code_dir,"scRNASeq_pipeline_functions.R"))
+
+# loading the libraries that are required throughout the analysis
+library_calls()
+```
+
+## A note on gene expression units
+Before we start, a brief but important note on units: RNA-Seq is inherently a method for relative quantification of gene expression. While UMI counts can be interpreted as "number of transcripts per cell", this unit is arbitrary and differs between each experiment and platform. Normalizing counts yields "normalized transcripts per cell", or, if scaled to the total number of counts per cell, "normalized counts per million total counts (CPMs)". However, **NONE of these units are comparable across different samples and even less so across different platforms!**. If you want to compare gene expression between different samples, you can do so only after appropriate between-sample normalization.
+
+## Terminology
+* Features: The term "features" refers to the things that were measured. In the context of scRNASeq, "features" means "genes", or, more accurately, "transcripts".
+* Feature controls: This is a set of features we use for quality control. Here, the feature controls correspond to mitochondrial genes.
+* Counts: Counts are the number of unique molecular identifiers (UMIs) mapped to each transcript. 
+* Expression: The term "expression" refers to gene expression level [arbitrary units!]. Usually, we use the log2-transformed normalized counts as a measure of gene expression.
+* Dropout: This is an observation of a zero count for a feature. Dropouts can be either true zeros (i.e., the gene is really not expressed), or technical artifacts (i.e. a transcript was not captured or failed to amplify). 
+
+## Preparing the data
+For this example, we will use a subset of a publicly available dataset from 10X genomics. The original dataset contains ~4500 Peripheral Blood Mononuclear Cells (PBMCs). The raw data can be downloaded [here](http://cf.10xgenomics.com/samples/cell-exp/2.0.1/pbmc4k/pbmc4k_raw_gene_bc_matrices.tar.gz). To make this vignette run in a reasonable amount of time, the example dataset (example_data/pbmc_example_counts.txt) was created from the raw data by randomly sampling 400 cells.
+
+In this first part, we will read the count matrix, annotate the cells and genes, and construct an SCESet that contains the count data as well as all the metadata:
+
+```{r,message=F,eval=F}
+# Read the dataset
+counts = read.delim(file.path(input_dir,"pbmc_example_counts.txt"),sep="\t")
+
+# if we have genes that are not expressed in any cell, discard them
+keep_feature = !gene_filter_by_feature_count(counts,0)
+counts = counts[keep_feature,]
+
+# make a table of metadata (e.g. batch, cell type annotation,treatment,...)
+# Here, we do not have any such information, so we just give each cell a name
+# Note that the rownames of this table have to correspond to the column names
+# of the count matrix.
+annot = data.frame(cell_idx=paste0("pbmc_C",seq(dim(counts)[2])))
+rownames(annot) = colnames(counts)
+pd = new("AnnotatedDataFrame", data=annot)
+
+# get gene annotations from ensembldb
+# optional: get gene descriptions from org.Hs.eg.db (slows down the process a lot!)
+# NOTE: the output of get_gene_annotations is a data.table sorted by gene identifier.
+#       This means the genes are no longer in the same order as in the count matrix!
+geneName = get_gene_annotations(rownames(counts),organism = "human",get_descriptions = F)
+
+# convert this to feature metadata
+fd_table = as.data.frame(geneName)
+rownames(fd_table) = geneName$gene_id
+fd_table = fd_table[rownames(counts),]
+fd = new("AnnotatedDataFrame",data=fd_table)
+
+#construct SCESet
+sce = newSCESet(countData = counts, phenoData=pd,featureData = fd)
+
+```
+
+Note that the `get_gene_annotations` function expects the gene identifiers to be ensembl IDs. Also, currently, only annotations for human and mouse genes are supported.
+
+## Quality control
+We will use scater to calculate various QC metrics. See the [package vignette](https://bioconductor.org/packages/release/bioc/vignettes/scater/inst/doc/vignette.html) for details. Then, we use the cyclone function in scran to assign cell cycle phases. Since this takes fairly long, we save the SCESet afterwards so we can just load it and continue the analysis at some later time. 
+
+```{r,eval=F}
+#calculate QC metrics
+sce = calculateQCMetrics(sce,feature_controls = list(MT=which(fData(sce)$chr=="MT")))
+
+# assign cell cycle phase (based on the method from scran)
+# because PBMCs are post-mitotic, most cells should be assigned to G0/G1 phase
+cc = annotate_cell_cycle(sce)
+sce$cell_cycle_phase = cc$phases
+sce$cc_scores = cc$scores
+
+#save the SCESet
+save(sce,file=file.path(out_data_dir,"sce_raw.RData"))
+```
+
+### Visualizing gene-level QC metrics
+
+We can use scater to plot various QC metrics. All of these plots are returned as ggplot objects, so it's very easy to modify them (e.g. add titles, change axis labels, ...). Saving plots is most convenient using `ggsave`. 
+
+For example, we can visualize the relative expression (percentage of total counts) of the top 50 expressed genes in each cell:
+
+```{r}
+load(file.path(out_data_dir,"sce_raw.RData"))
+
+p1 = plotQC(sce, type="high",feature_names_to_plot = "symbol") 
+print(p1)
+
+```
+
+As expected, we mostly find ribosomal proteins and core metabolic genes among the top 50 genes.
+
+Using a slightly modified version of the scater function, we can also make a similar plot for the absolute raw expression values per gene:
+
+```{r}
+p1.2 = custom_plotHighestExprs(sce,feature_names_to_plot = "symbol")
+p1.2 = p1.2 + xlab("Expression [raw counts, log2]")
+print(p1.2)
+
+# to save a plot, use the ggsave function:
+ggsave(p1.2, file = "saved_example_plot.pdf",height=7,width=7)
+```
+
+In general, this picks up similar genes than the previous plot. Exceptions are genes that are expressed extremely high, but only in few cells, where the ranking according to percentage of total counts is much lower than the one according to mean expression. 
+
+Next, we can plot the detection rate v.s. mean expression for each gene. This gives a general idea of the quality of our data, i.e. how many genes were detected, what was the dropout rate etc.
+
+```{r,warning=F}
+p2 = plotQC(sce, type = "exprs-freq-vs-mean") 
+p2 = p2+xlab("Mean expression [raw counts, log2]")+ggtitle("Mean expression versus detection rate")
+print(p2)
+# Check total number of zeroes
+t = table(counts(sce)==0)
+print(t/sum(t)*100)
+```
+
+From these three plots, we can see that the data are very sparse. We find a high number of dropouts and even for the most highly expressed genes, there are still some cells having zero counts. Moreover, only very few genes are expressed in more than 50% of all cells.
+If we check for the total number of zero counts, we see that over 90% of all counts are zeroes, which indicates that probably sequencing depth was not very high for this dataset or the cells had rather low RNA content.
+
+### Identifying confounders
+
+Scater also includes some functions that help to identify possible confounding factors. For example, a known widespread bias in scRNASeq experiments is the total number of features detected per cell:
+
+```{r}
+p3 = plotQC(sce, type="find", variable="total_features") 
+print(p3 + ggtitle("Correlation of principal components with total detected features."))
+```
+
+Or maybe there is some bias from cell cycle phase:
+
+```{r}
+p3.2 = plotQC(sce, type="find", variable="cell_cycle_phase")
+print(p3.2+ggtitle("Correlation of principal components with cell cycle phase."))
+```
+
+Lastly, scater includes a function that determines the amount of variance explained by possible confounding factors:
+
+```{r}
+vars = c("total_counts","total_features","cell_cycle_phase")
+p4 = plotQC(sce, type="expl", variables=vars)
+print(p4 + ggtitle("Percentage of explained variance"))
+```
+
+Here, none of the factors contribute significantly to the observed variance and we conclude that there are no major confounders present.
+
+### Filtering low-quality cells
+
+As a first step, we set manual thresholds for the following QC metrics:
+
+* the total number of detected features (min_genes, on log2 scale)
+* the total number of UMIs ("counts") per cell (min_UMI, on log2 scale)
+* the percentage of counts attributed to mitochondrial genes (mt_threshold)
+
+```{r}
+min_genes = 9.0 #minimum number of features (genes) per cell [log2]
+min_UMI = 10.5  #minimum total UMIs / cell [log2]
+mt_threshold = 9 #Maximum percentage of mitochondrial genes
+```
+
+We can check whether those thresholds make sense by calling the `plot_RNA_QC` and `plot_MT_QC` functions. For the RNA content, we would like to get rid of the left-hand tails of the distributions. For the mitochondrial genes, we remove outliers. On the second plot of the MT QC, we can see that most cells with very high mitochondrial gene content have overall poor coverage. 
+
+```{r}
+plot_RNA_QC(sce, min_genes = min_genes, min_UMI = min_UMI)
+plot_MT_QC(sce,mt_threshold)
+
+```
+
+Now that we are happy with the thresholding, we can filter the cells:
+
+```{r}
+sce$keep_manual = (   !cell_filter_by_feature_count(counts(sce),2^min_genes) &
+                      !cell_filter_by_total_UMI(counts(sce),2^min_UMI) &                                !cell_filter_by_mt_content(sce$pct_counts_feature_controls_MT,mt_threshold))
+
+table(sce$keep_manual)
+
+sce_clean = sce[,sce$keep_manual]
+```
+
+Note that all filtering functions return logical vectors. It is therefore also possible to just flag the cells as outliers, but keep them in the analysis.
+
+Next, we filter the genes. There are two parameters to set:
+
+* n_th: The minimum number of cells
+* min_counts: The minimum number of counts
+
+The filter will then remove any gene not having at least `min_counts` counts in at least `n_th` cells. 
+
+Here, we want to remove all genes that do not have at least 2 counts in at least 1 cell.
+
+```{r}
+n_th = 1
+min_counts = 2
+
+keep_feature = !(gene_filter_by_feature_count(counts(sce_clean),n_th, min_counts))
+sce_clean = sce_clean[keep_feature,]
+```
+
+Finally, we use scaters automatic outlier detection feature to flag and/or remove any additional outlier cells:
+
+```{r}
+
+sce_clean = calculateQCMetrics(sce_clean,feature_controls = list(MT=which(fData(sce_clean)$chr=="MT")))
+
+# The variables used to detect outliers
+vars = c( "pct_counts_top_100_features", 
+          "total_features", "pct_counts_feature_controls", 
+           "log10_counts_endogenous_features", 
+           "log10_counts_feature_controls")
+
+sce_clean = plotPCA(sce_clean,
+                    size_by = "total_features", 
+                    pca_data_input = "pdata",
+                    selected_variables = vars,
+                    detect_outliers = TRUE,
+                    return_SCESet = TRUE)
+
+table(sce_clean$outlier)
+
+#here, we remove the outliers
+sce_clean = sce_clean[,!sce_clean$outlier]
+
+# Finally, we again remove genes that are not expressed
+keep_feature = !(gene_filter_by_feature_count(counts(sce_clean),n_th,min_counts))
+sce_clean = sce_clean[keep_feature,]
+
+save(sce_clean, file = file.path(out_data_dir,"sce_clean.RData"))
+```
+
+In this case, PC1 can be interpreted as "RNA content", whereas PC2 is dominated by metrics describing diversity.
+
+To visualize the raw data, we can make a PCA plot using `my_plot_PCA`. For a detailed description of all parameters of this function, check the [function documentation](## Functions). For very large datasets, it is a good idea to set `use_irlba=TRUE`. This will then use `prcomp_irlba` to perform an approximate calculation of the first couple of principal components, which is much faster than PCA.
+
+Because the counts are spread over several orders of magnitude, it is generally a good idea to log-transform them before running PCA:
+
+```{r}
+p = my_plot_PCA(counts = log2(counts(sce_clean)+1),
+                scale_pca = T, center_pca = T, return_pca = F, use_irlba=F,
+                color = pData(sce_clean)[,"total_features",drop=F])
+p = p+ggtitle("PCA on raw log2(counts)")
+print(p)
+```
+
+Coloring the PCA by the total number of features detected shows that the first principal component primarily separates cells by the total number of features detected. This is expected for raw data and we will see this trend disappear after normalization.
+
+Alternatively, we can make a tSNE projection of the log2-transformed counts using `my_plot_tSNE`:
+
+```{r}
+p = my_plot_tSNE(counts = log2(counts(sce_clean)+1),
+                 is_distance = F, scale_pca = F, n_comp = 50, return_tsne=F,
+                 color = pData(sce_clean)[,"total_features",drop=F])
+p = p+ggtitle("t-SNE on raw log2(counts)")
+print(p)
+```
+
+Here, we also see some separation according to the number of total detected features, but less strongly than in the PCA. In addition, we start to see 3 distinct clusters. This is what we would expect as there are 3 most abundant cell types among PBMCs (B-cells, T-cells/NK cells and monocytes).
+
+## Normalization
+Normalizing the data is required to remove systematic differences between cells that arise from different RNA capture efficiency, sequencing depth, or differences in RNA content between cells. The function `normalize_counts` adds the normalized expression data (on a log2 scale) to the `norm_exprs` slot of the SCESet. We can choose between different normalization methods (see function documentation). In general, they perform very similar to each other. However, because we have very sparse data and methods originally developed for bulk RNA-Seq data (TMM, RLE, TC) often have issues handling many zeroes, we use the method implemented in the scran package which was specifically designed to work on sparse data.
+
+```{r,message=F}
+# normalize data
+sce_clean = normalize_counts(sce_clean,method = "scran")
+
+# normalized values are automatically log2-transformed and
+# stored in the norm_exprs slot of the SCESet
+norm_exprs(sce_clean)[1:5,1:5]
+
+save(sce_clean, file = file.path(out_data_dir,"sce_clean.RData"))
+```
+
+We can again visualize the data using PCA and tSNE:
+
+```{r}
+# PCA of normalized values
+sum_norm = data.frame(sum_expression = colSums(norm_exprs(sce_clean)))
+p1 = my_plot_PCA(counts = norm_exprs(sce_clean),
+                 color=sum_norm,
+                 return_pca = F, scale_pca = T, center_pca = T)
+p1 = p1+ggtitle("PCA on normalized counts")
+print(p1)
+
+#tSNE of normalized values
+p2 = my_plot_tSNE(counts = norm_exprs(sce_clean),
+                  color=sum_norm,
+                  return_tsne = F, is_distance = F)
+p2 = p2 + ggtitle("t-SNE (50 PCs) on normalized counts")
+print(p2)
+```
+
+As expected, after normalization, the first principal component is no longer separating cells by how many genes they express and we now find 3 distinct clusters, similar to what we saw in the initial tSNE projection.
+
+## Feature selection 
+Feature selection is a crucial part of this workflow, because by selecting the most informative genes, we can greatly improve the signal/noise ratio. The workflow includes multiple ways of selecting interesting genes:
+
+1. Using prior knowledge: select all the genes that are annotated with some GO term of interest. Here, we will use GO:0002376 (immune system process) as an example.
+2. Based on sample variance: This method is described by [Brennecke et. al, 2013](http://www.nature.com/nmeth/journal/v10/n11/full/nmeth.2645.html?foxtrotcallback=true). Informative genes are those with higher than expected sample variance.
+3. Based on a mean-dispersion fit using a depth-adjusted negative binomial model (DANB): This method is implemented in versions > 2.0 of M3Drop (Andrews and Hemberg, pre-print can be found [here](https://www.biorxiv.org/content/early/2016/10/20/065094))
+
+In the following, we will use the different approaches and see how they affect our PCA plot. To make sure we actually see true cell type clusters, we color the PCA by the expression of a known B-cell marker (ENSG00000156738, i.e. CD20). 
+
+For a detailed description of each function used in this section, check the [Function documentation](#feature-selection-2)
+
+### Feature selection based on GO annotation
+
+```{r,message=F}
+cd20 = t(norm_exprs(sce_clean["ENSG00000156738",]))
+colnames(cd20) = "CD20"
+
+go_id = "GO:0002376" 
+ens_go = GO_to_gene(go_id)
+info_GO = rownames(sce_clean)%in%ens_go
+table(info_GO)
+
+p = my_plot_PCA(counts = norm_exprs(sce_clean[info_GO,]),
+                 return_pca = F, scale_pca = T, center_pca = T,
+                title = "PCA - GO:0002376 features",
+                color = cd20)
+print(p)
+```
+
+### Feature selection using highly-variable genes method
+
+```{r}
+info_HVG = info.genes(2^norm_exprs(sce_clean)-1,PLOT=T,qcv=0.25,pv=.1,q=.5,minBiolDisp = 0) 
+table(info_HVG)
+p = my_plot_PCA(counts = norm_exprs(sce_clean[info_HVG,]),
+                 return_pca = F, scale_pca = T, center_pca = T,
+                title = "PCA - HVG features",
+                color = cd20)
+print(p)
+```
+
+### Feature selection using DANB
+The `run_DANB` function is a wrapper to both NBDrop and NBDisp methods that are implemented in newer versions (>2.0) of the M3Drop package. Briefly, NBDrop selects genes with unexpected dropout rates while NBDisp selects informative genes based on higher than expected dispersions. In general, NBDrop is less prone to selecting very low expressed genes, but on the downside, if the the total number of features detected per cell is a confounder, NBDrop can enhance this effect. Note that DANB requires raw counts as input.
+
+To modify the number of genes selected, you can either set the `cutoff` variable, which is a p-value cutoff for NBDrop, or set `perc_genes`, in which case the top `perc_genes` percentage of genes will be chosen.
+
+```{r}
+info_NBdrop = run_DANB(counts(sce_clean),method = "NBDrop",save_plot=F, cutoff = 0.1) 
+info_NBdisp = run_DANB(counts(sce_clean),method = "NBDisp",save_plot=F, perc_genes = 10) 
+table(info_NBdrop,info_NBdisp)
+
+p = my_plot_PCA(counts = norm_exprs(sce_clean[info_NBdrop,]),
+                 return_pca = F, scale_pca = T, center_pca = T,
+                title = "PCA - NBDrop features",
+                color = cd20)
+print(p)
+p = my_plot_PCA(counts = norm_exprs(sce_clean[info_NBdisp,]),
+                 return_pca = F, scale_pca = T, center_pca = T,
+                title = "PCA - NBDisp features",
+                color = cd20)
+print(p)
+```
+
+### Feature selection - Conclusion
+In conclusion, we see that by selecting a biological process that we know affects the expected cell types, we can increase the variation between the three observed clusters while cells belonging to the same cluster move closer together. Also, note how the variation explained by the first two principal components increases drastically when we select a small number of informative genes. A similar result is obtained when using DANB with either the NBDisp or NBDrop method, with NBDrop in this case outperforming NBDisp. The HVG method fails to improve this signal/noise ratio. This is most likely because it was originally developed for fluidigm C1 data (no UMIs).  On our type of data, it tends to be biased towards low expressed genes as the underlying mean-dispersion model is not fitting well.
+
+I suggest to exclusively use DANB in the future. Which version of this method is best depends on your data:
+
+* The NBDrop version  works very well if you expect your highly variable genes to have a binary expression pattern (expressed in one cell type but not expressed at all in others). If there are (technical or biological) differences in dropout rates between cell types, however, NBDrop selects genes that only separate cells according to dropout rate. 
+
+* NBDisp selects genes based on dispersion, which is dependent on variance. NBDisp is therefore slightly more biased towards low-expressed genes. In general, this is not really a problem and I found NBDisp to perform very well on all datasets tested.
+
+In the following, we will use only the genes selected by NBDrop.
+
+```{r, eval=F}
+sce_info = sce_clean[info_NBdrop,]
+dim(sce_info)
+
+# tSNE map of the cleaned data
+# note that by setting return_tsne = T, we can obtain the t-SNE object for later use
+tsne_info = my_plot_tSNE(counts = norm_exprs(sce_info),
+                         scale_pca = F, n_comp = 50, return_tsne=T)$tsne
+```
+
+We will save the SCESet and the t-SNE map for later use:
+
+```{r,eval=F}
+save(sce_info, file = file.path(out_data_dir,"sce_info.RData"))
+save(tsne_info,file = file.path(out_data_dir,"tsne_info.RData"))
+```
+
+```{r}
+#load the data we need
+load(file.path(out_data_dir,"sce_info.RData"))
+load(file.path(out_data_dir,"tsne_info.RData"))
+```
+
+## Clustering
+The workflow contains different types of clustering approaches. Which one is most appropriate depends on your data. As a rule of thumb, if your data contains clearly separated clusters, all algorithms should produce a similar result. If you get very different results, maybe there really are no clear clusters and you might be better off using an approach tailored to more continuous cell type changes (e.g. monocle, SLICER). A good overview of the different decisions required when carrying out cluster analysis can be found in [this](https://arxiv.org/pdf/1503.02059.pdf) paper by Henning et. al.
+
+For a detailed description of the functions used in this section, see [Function documentation](#clustering-2)
+
+Before we try any of the methods, we do a quick and dirty annotation of the four major cell types based on marker expression. We use CD20 expression to identify B-cells, the sum of CD14, LYZ, FCGR3A and MS4A7 for any type of Monocyte, CD3 for T-cells and the sum of GNLY and NKG7 for natural killer cells.
+
+```{r, fig.align='center', fig.width=12, fig.height=8}
+b_cell = t(norm_exprs(sce_info["ENSG00000156738",]))
+colnames(b_cell) = "B-cell"
+
+monocyte = data.frame(Monocyte = colSums(norm_exprs(sce_info)[which(fData(sce_info)$symbol %in% c('CD14','LYZ','FCGR3A','MS4A7')),]))
+
+t_cell = data.frame(`T-cell` = colSums(norm_exprs(sce_info)[which(fData(sce_info)$symbol %in% c('CD3E','CD3D','CD3G')),]))
+
+nk_cell = data.frame(`NK cell` = colSums(norm_exprs(sce_info)[which(fData(sce_info)$symbol %in% c('GNLY','NKG7')),]))
+
+# Make plots
+# Note that by providing the tsne input variable instead of counts,
+# we can use an existing t-SNE calculation for plotting
+
+p1 = my_plot_tSNE(tsne = tsne_info, color = b_cell, title = "B-cell marker expression")  
+p2 = my_plot_tSNE(tsne = tsne_info, color = monocyte, title = "Monocyte marker expression")
+p3 = my_plot_tSNE(tsne = tsne_info, color = t_cell, title = "T-cell marker expression")
+p4 = my_plot_tSNE(tsne = tsne_info, color = nk_cell, title = " NK cell marker expression")
+ggmultiplot(p1,p2,p3,p4,cols=2)
+```
+
+```{r}
+assignment = data.table(tsne1 = tsne_info$Y[,1], tsne2 = tsne_info$Y[,2],cell_type = 'T-cell')
+assignment[tsne1 < -10 ,cell_type:='B-cell']
+assignment[tsne1 > 5 ,cell_type:='Monocyte']
+assignment[tsne2 < -17 & tsne1 > -1,cell_type:='NK Cell']
+
+sce_info$cell_type = assignment$cell_type
+
+p = my_plot_tSNE(tsne = tsne_info, color = pData(sce_info)[,"cell_type",drop=F])
+print(p+labs(title="t-SNE on informative genes",subtitle = "Colored by manual cell annotation"))
+
+```
+
+### Single-cell consensus clustering (SC3)
+SC3 ([Kiselev et. al, 2016](http://www.nature.com/nmeth/journal/v14/n5/full/nmeth.4236.html?foxtrotcallback=true)) is a tool for unsupervised clustering that integrates multiple clustering approaches and constructs a consensus clustering from them. In a nutshell, different distance measures and transformations are considered and for each combination, a k-means clustering is run. From this, a consensus matrix is constructed that summarizes how often each cell is in the same cluster with each other cell. The final clustering otput is obtained by hierarchical clustering of the consensus matrix.
+
+The advantages of SC3 are that it is more robust to clustering inputs and parameter selection than other methods. Moreover, it was developed to work together with scater and therefore is very easy to use in combination with the rest of this workflow.
+
+The downside of SC3 is that the many clusterings that are generated take some time. According to the authors, SC3 takes ~20 min to run on a dataset with 2000 cells. Another thing to keep in mind is that SC3 uses k-means clustering, which in turn assumes all clusters are equaly sized spheres. In cases where this assumption does not hold, k-means will either split big clusters in a lot of tiny ones or, if forced to use a smaller number of clusters, fail completely. 
+
+To run SC3 with the default settings, we just need one function, `sc3()`. Here, we will manually run the individual steps of SC3 to make the analysis a bit more transparent. 
+
+First, we prepare the SCESet for the analyisis. This will add all the relevant parameters to the sc3 slot of the object. The parameters we set are
+
+* ks: the number of clusters we would like to test
+* n_cores = number of cores used in parallel computing. NOTE: if you do not set this parameter, the function will use the number of available cores -1, which is a really bad idea on a server! 
+
+```{r, echo=F}
+library(SC3)
+```
+
+```{r,eval=F}
+library(SC3)
+sce_info = sc3_prepare(sce_info, ks = 2:10, n_cores = 4)
+```
+
+Next, we let SC3 determine the best number of clusters to use. For a detailed description on how the number of clusters is chosen, see the methods section of the [paper](http://www.nature.com/nmeth/journal/v14/n5/full/nmeth.4236.html?foxtrotcallback=true) 
+
+```{r,eval=F}
+sce_info = sc3_estimate_k(sce_info)
+sce_info@sc3$k_estimation
+```
+
+And now we run SC3 using 6 clusters. Setting biology = TRUE tells SC3 that it should calculate biological properties of the clusters:
+
+```{r,eval=F}
+sce_info = sc3(sce_info, ks = 6, biology = TRUE, n_cores = 4)
+```
+
+Note: If your dataset contains more than 5000 cells, SC3 will automatically switch to the "hybrid SVM" version of the algorithm. In that case, skip the above and run the following instead:
+
+```{r, eval = F}
+sce_info = sc3(sce_info, ks = 6, biology = F, n_cores = 8)
+sce_info = sc3_run_svm(sce_info)
+
+sce_info@sc3$svm_train_inds = NULL
+sce_info = sc3_calc_biology(sce_info, k=c(8,13), regime = "marker")
+
+# to visualize the markers, use my modified fuction:
+
+# change the plotted gene names to symbol for better readability
+plot_sce = sce_info
+rownames(plot_sce) = fData(plot_sce)$symbol
+custom_sc3_plot_markers(plot_sce, k=6, p.val = 0.01, auroc = 0.90)
+
+rm(plot_sce)
+```
+
+SC3 also has a couple of nice visualization functions. For example, we can plot the consensus matrix:
+
+```{r, out.width="110%",fig.height=4}
+sc3_plot_consensus(sce_info, k=6)
+```
+
+In this plot, a value of 1 means the cells are always together in the same cluster. A value of 0 means they are never in the same cluster. Values in between indicate that it is not so clear where the cell belongs.
+
+We can also make a heatmap of gene expression. With the show_pdata parameter, we can add any column in pData sce to annotate the cells:
+
+```{r, out.width="110%",fig.height=4}
+sc3_plot_expression(sce_info, k = 6, show_pdata = c("cell_type"))
+```
+
+Because we set biology to TRUE, SC3 determined marker genes for each cluster. We can have a look at them here (NOTE: use the custom version of the `sc3_plot_markers` function if you used the hybrid SVM approach!):
+
+```{r, out.width="110%",fig.height=6}
+# change the plotted gene names to symbol for better readability
+plot_sce = sce_info
+rownames(plot_sce) = fData(plot_sce)$symbol
+sc3_plot_markers(plot_sce, k=6, p.val = 0.01, auroc = 0.90, show_pdata = c("cell_type"))
+
+# for hybrid SVM approach:
+# custom_sc3_plot_markers(plot_sce, k=6, p.val = 0.01, auroc = 0.90)
+```
+
+In this plot, we see that SC3 correctly identified known markers for the different cell types. In addition, we see that there are 2 larger groups among the T-cells. Checking the marker expression, we find that cluster 4 (high CCL5 and IL32) corresponds to CD8+ cytotoxic T-cells, whereas the remaining T-cells likely are T helper cells, although we did not find the characteristic CD4 marker. Cluster 2 remains unlabeled. We can visualize our assignment on the t-SNE map. Setting `show_proprtions=T` adds the relative number of cells per cluster to the legend:
+
+```{r}
+assignment = data.table(clust = sce_info$sc3_6_clusters, cell_type = sce_info$cell_type)
+assignment[clust == 1, cell_type:= 'T helper cell']
+assignment[clust == 2, cell_type:= 'Monocyte']
+assignment[clust==3,cell_type:='?']
+assignment[clust==4,cell_type:='CD8+ T-cell']
+assignment[clust==5,cell_type:='NK cell']
+assignment[clust == 6, cell_type:= 'B-cell']
+
+sce_info$SC3_assignment = assignment$cell_type
+p = my_plot_tSNE(tsne = tsne_info,
+                 color = pData(sce_info)[,"SC3_assignment",drop=F],
+                 shape = pData(sce_info)[,"cell_type",drop=F],
+                 title = "SC3 assignment",
+                 show_proportions = T)
+print(p)
+save(sce_info,file = file.path(out_data_dir,"sce_info.RData"))
+```
+
+### Hierarchical clustering (hclust)
+Hierarchical clustering groups items according to some measure of similarity by sequentially joining the two most similar observations into a cluster. Therefore, selecting an informative distance measure is crucial for this algorithm to work. We will consider two commonly used distance measures in the following.
+
+#### Euclidean distance
+Euclidean distances in very high dimensional space tend to get all very large and very similar to each other, making cluster identification near impossible. As a workaround, we will reduce the dimensionality of the dataset using PCA before calculating the cell-cell distances.
+
+```{r}
+pca = my_plot_PCA(counts = norm_exprs(sce_info),return_pca=T)$pca
+screeplot(pca,type = 'lines')
+```
+
+From the screeplot, we see that after the 6th component, the variance stays more or less constant. We therefore select 6 components for the distance calculation:
+
+```{r}
+dist_eucl = dist.gen(pca$x[,1:6],method='euclidean')
+hfit = hclust(dist_eucl,method="average")
+plot(hfit, labels = F, main = "hclust on euclidean distance in PCA space")
+```
+
+In this dendrogram, we see that there seem to be 6 major clusters present, however, they are somewhat nested. A fixed height cut of the dendrogram would here merge some clusters that should not be merged while creating small sets of outlier cells. To prevent this, we can use dynamic ct of the dendrogram:
+
+```{r, message =F}
+library(dynamicTreeCut)
+groups_hclust_eucl = cutreeDynamic(hfit, distM = as.matrix(dist_eucl), deepSplit = 0, minClusterSize = 5, maxCoreScatter = 0.70, minGap = 0.25)
+```
+
+To get an idea of the quality of our clustering, we can make a silhoutte plot:
+
+```{r}
+library(cluster)
+si = silhouette(groups_hclust_eucl,dist_eucl)
+plot(si, col = "darkgray", border=NA, main = "Silhouette plot for hclust (euclidean in PCA space)")
+```
+
+The cluster silhoutte is a measure of how similar a point is to other points in the same cluster, relative to how similar it is to points in the closest cluster it does not belong to. A value close to 1 means the point is very well clustered. Values close to 0 indicate points lying between clusters. A negative value means the point is probably misassigned.
+
+We can also plot the silhoutte values on the tSNE map:
+```{r}
+sce_info$hclust_sil = si[,3]
+p = my_plot_tSNE(tsne = tsne_info,
+                 color = pData(sce_info)[,"hclust_sil",drop=F],
+                 shape = pData(sce_info)[,"cell_type",drop=F],
+                 title = "tSNE colored by silhouette width")
+print(p+scale_color_distiller(type="div", palette = "RdBu"))
+```
+
+As expected, the points with low silhoutte values are in between the clearly visible clusters.
+
+Now we can compare the new assignment with what we obtained from SC3:
+
+```{r}
+sce_info$hclust_eucl = as.factor(groups_hclust_eucl)
+table(sce_info$SC3_assignment,sce_info$hclust_eucl)
+```
+
+We see that the assignments of the two methods are very similar. In addition to the clusters found by SC3, hclust identified a tiny cluster of monocytes (cluster 6). Let's have a look at the expression of some monocyte marker genes. To do so, we make use of the `plotExpression` function from the scater package:
+
+```{r}
+# change the plotted gene names to symbol for better readability
+plot_sce = sce_info
+rownames(plot_sce) = fData(plot_sce)$symbol
+monocyte_markers = which(fData(sce_info)$symbol %in% c('CD14','LYZ','FCGR3A','MS4A7'))
+p = plotExpression(plot_sce,features = monocyte_markers, x="hclust_eucl",
+               colour_by = "hclust_eucl")
+print(p)
+```
+
+We see that our small population of monocytes has low expression of LYZ and CD14 but high expression of CD16 (FCGR3A) and MS4A7. We therefore conclude that this small population corresponds to the CD14+/CD16++ monocytes whereas the remaining monocytes are the "classical" CD14++/CD16- monocytes.
+
+We can now label our assignment accordingly and visualize on tSNE map:
+
+```{r,fig.width = 8}
+sce_info$hclust_eucl = factor(sce_info$hclust_eucl, levels = levels(sce_info$hclust_eucl), labels = c("T-helper cell","CD14++/CD16- Monocyte","B-cell","CD8+ T-cell","NK cell","CD14+/CD16++ Monocyte"))
+p = my_plot_tSNE(tsne = tsne_info, color = pData(sce_info)[,"hclust_eucl",drop=F],
+                 shape = pData(sce_info)[,"cell_type",drop=F],
+                 title = "hclust (euclidean) assignment",
+                 show_proportions = T)
+print(p)
+```
+
+#### Pearson distance
+Another possible distance measure is Pearson correlation, where the distance is calculated as 1-correlation. We again try to get 6 clusters:
+
+```{r}
+library(dendextend)
+dist_pearson = dist.gen(t(norm_exprs(sce_info)),method = "pearson")
+hfit = hclust(dist_pearson,method="average")
+groups_hclust_pearson = cutree(hfit, k=6)
+sce_info$hclust_pearson = as.factor(groups_hclust_pearson)
+hfit2 = color_branches(hfit, k=6)
+hfit2 = hfit2 %>% set("labels", rep("",dim(sce_info)[2]))
+plot(hfit2, main = "hclust on Pearson correlation")
+```
+
+From the dendrogram, we can already guess that we did not get a very fine-grained clustering. But let's check on the tSNE-map anyway:
+
+```{r,fig.width=8}
+p = my_plot_tSNE(tsne = tsne_info, color = pData(sce_info)[,"hclust_pearson",drop=F],
+                 shape = pData(sce_info)[,"cell_type",drop=F],
+                 title = "hclust (Pearson) assignment",
+                 show_proportions = T)
+print(p)
+```
+
+While we can find the major cell types, we can no longer identify subgroups within the T-cells and the monocytes. Most likely this is due to the underlying noise in the data, which makes all correlations very similar. Sometimes, using the euclidean distance of the correlation matrix improves the clustering. We could also use PCA here to reduce the number of dimensions before calculating the correlation matrix. This would hopefully increase the signal to noise ratio, but since we already succesfully applied dimensionality reduction in combination with euclidean distance, we leave it be.
+
+In conclusion, hierarchical clustering is a very useful clustering technique that does not require any assumptions on the number of clusters (at least, not before the algorithm is run, you still have to decide where to cut the dendrogram afterwards) or the distribution the data come from. However, selecting an informative input distance is crucial. Reducing dimensionality before calculating distances often improves the signal to noise ratio, but might come at the cost of loosing some information. The major drawback of hierarchical clustering is that it is very computationally expensive and becomes infeasible for very large datasets (ten thousands of cells).
+
+### pcaReduce
+pcaReduce is an agglomerative clustering method based on k-means and PCA. Cells are initially grouped into many clusters using k-means in PCA space. Clusters are then merged, and data are projected into lower dimensional space (i.e. for each reduction in the number of clusters, one principal component is removed). For details, see the [paper](https://bmcbioinformatics.biomedcentral.com/articles/10.1186/s12859-016-0984-y).
+
+```{r}
+library(pcaReduce)
+expr_mat_info = t(norm_exprs(sce_info))
+assignment_info = PCAreduce(expr_mat_info, nbt = 5, q = 6, method = "M")
+```
+
+`pcaReduce` returns a list of cluster assignments. Each element of the list corresponds to one run of the algorithm (here, we ran it 5 times by setting `nbt=5`) and is a matrix of cluster assignments, starting with `q+1` clusters in the first column and ending with 2 clusters in the last. Here, we will look at the assignment with 4 clusters:
+
+```{r,fig.width=12,fig.height=6}
+table(assignment_info[[1]][,4])
+
+plots = list()
+for(i in 1:5){
+  df = data.frame(apply(assignment_info[[i]],c(1,2),as.factor))
+  p = my_plot_tSNE(tsne=tsne_info, color = df[,'cl_id.2',drop=F],
+                   shape = pData(sce_info)[,"cell_type",drop=F],
+                   title = paste0("pcaReduce, run ", i))
+  plots[[i]] = p
+}
+
+ggmultiplot(plots[[1]],plots[[2]],plots[[3]],plots[[4]],plots[[5]],cols=3)
+
+```
+
+Note that each time, the output is slighrly different, but the overall structure of the clusters is consistent.
+
+### Graph-based methods
+
+#### MCL
+The MCL algorithm is short for the Markov Cluster Algorithm. It is an unsupervised cluster algorithm for graphs based on simulation of (stochastic) flow in graphs ([van Dongen et. al](https://micans.org/mcl/)). 
+
+As a first step, we will construct an adjacency matrix from a similarity matrix using the function `build_adjacency_matrix`. This function takes as input either a pre-computed similarity matrix or the raw counts from which to calculate a correlation matrix. In addition, it requires a value for the similarity cutoff. It then builds a binary matrix of 1s and 0s form this information. A 1 means the similarity was larger than the cutoff. We can set the  cutoff to "auto", this way, the algorithm will look for a valley in the distribution of similarities and use this as a cutoff. The function returns a list with the following entries:
+
+* adj: The adjacency matrix
+* cor: The similarity matrix
+* cutoff: The similarity cutoff
+
+We will use the 1 -  the relative euclidean distance in PCA space as our similarity measure:
+
+```{r, message = F}
+sim = 1-as.matrix(dist_eucl)/max(dist_eucl)
+adj_corr = build_adjacency_matrix(mat = sim,cutoff="auto",is_similarity=T)
+```
+
+Now we run MCL with the above list as input:
+
+```{r, message = F}
+groups_MCL = MCLcell.clust(adj_corr,mcl_path = "/da/dmp/cb/prog/mcl-14-137/bin/mcl")
+sce_info$MCL = as.factor(groups_MCL)
+table(sce_info$MCL,sce_info$hclust_eucl)
+```
+
+We see that the result is almost the same as that found by the hierarchical clustering, also visible on the tSNE-map:
+
+```{r, fig.width = 8}
+p = my_plot_tSNE(tsne = tsne_info, color = pData(sce_info)[,"MCL",drop=F],
+                 shape = pData(sce_info)[,"hclust_eucl",drop=F],
+                 title = "MCL (cutoff=auto) assignment",
+                 show_proportions = T)
+print(p)
+```
+
+However, MCL did not manage to find the two T-cell populations. We can try changing the cutoff for the calculation of the adjacency matrix and re-run the algorithm:
+
+```{r,fig.height=6,fig.width = 9}
+adj_corr = build_adjacency_matrix(mat = sim,cutoff=0.8,is_similarity=T)
+groups_MCL = MCLcell.clust(adj_corr,mcl_path = "/da/dmp/cb/prog/mcl-14-137/bin/mcl")
+sce_info$MCL2 = as.factor(groups_MCL)
+table(sce_info$MCL2,sce_info$hclust_eucl)
+
+p = my_plot_tSNE(tsne = tsne_info, color = pData(sce_info)[,"MCL2",drop=F],
+                 shape = pData(sce_info)[,"hclust_eucl",drop=F],
+                 title = "MCL (cutoff=0.7) assignment",
+                 show_proportions = T)
+p = p + scale_color_manual(values = brewer.pal(10,"Paired"))
+print(p)
+```
+
+We note that by raising the similarity cutoff, we can force MCL to make more clusters. We now find the expected populations, but we also start splitting clusters that probably should not be split.
+
+In conclusion, MCL performs similar to hierearchical clustering. Its main advantage is that it is much faster than hclust and can therefore be used on datasets with ten thousands of cells. The main drawback is that MCL is very sensitive to the provided input. Using a similarity measure that does not appropriately separate cells or using the wrong similarity cutoff will lead to MCL making lots of clusters with just one cell inside. The automated cutoff determination should provide some guidance here, but it is not guaranteed to work in all cases. 
+
+#### Seurat
+Note: You might have to restart R before trying to load Seurat, because this package alone loads 121 (!) dependencies, which might just crash R. 
+
+We can run the clustering part of seurat by using the `seurat_clustering` wrapper (note that the two following sections are not run in the example due to the `maximum number of DLLs reached` error that is encountered when loading Seurat):
+
+```{r,eval = F}
+library(Seurat)
+seurat_assignments = seurat_clustering(sce_info,vars.to.regress=NULL,res=1.2)
+sce_info$seurat = as.factor(seurat_assignments)
+```
+
+And compare the assignments to hclust:
+
+```{r,fig.width=8, eval = F}
+table(sce_info$seurat,sce_info$hclust_eucl)
+p = my_plot_tSNE(tsne = tsne_info, color = pData(sce_info)[,"seurat",drop=F],
+                 shape = pData(sce_info)[,"hclust_eucl",drop=F],
+                 title = "Seurat assignment",show_proportions = T)
+print(p)
+```
+
+In general, I did not find seurat to be more useful than MCL and loading the whole package just for the clustering is a bit of a pain.
+
+### Density clustering (DBSCAN)
+DBSCAN is a density clustering algorithm that is based on a k-nearest neighbor search. In a nutshell, it identifies clusters as regions in space that contain many points with shared neighbors. DBSCAN works best in a lower dimensional space, so we weill again use the coordinates in PCA space as input. The `run_dbscan` function requires the following inputs:
+
+* a distance matrix
+* minPts: The minimal number of neighbors a point has to have to be considered "high density". Usually, this is set to the dimensionality of the dataset +1, so here, we set it to the number of principal components used (6) + 1.
+* eps: Size of the epsilon neighborhoos. If we make a k-nearest neighbor distance plot using `kNNdistplot`, eps is the y-value at the "elbow" of that plot. For convenience, we can set eps to "auto", then the function `run_dbscan` will automatically set it.
+* tol (optional): This is a parameter for the tolerance when determining eps. The higher it is, the higher the returned eps will be. We set it to 0.005 here, this way, eps is exactly at the elbow of the kNNdistplot.
+
+```{r}
+DBSCAN_groups = run_dbscan(dist_eucl,eps="auto",min_pts=7,tol=0.005)
+```
+
+Visualize the assignment:
+
+```{r,fig.height=6,fig.width=8}
+sce_info$DBSCAN = as.factor(DBSCAN_groups)
+p = my_plot_tSNE(tsne = tsne_info, color = pData(sce_info)[,"DBSCAN",drop=F],
+                 shape = pData(sce_info)[,"hclust_eucl",drop=F],
+                 title = "DBSCAN assignment",show_proportions = T)
+print(p)
+
+```
+
+We see that DBSCAN correctly identified the clearly separated clusters, but failed for the more continuous ones. This illustrates the main disadvantage of this algorithm: It can only find clusters that have no density between them. On the bright side, it is really fast and it does not require any assumptions of the cluster shape or size.
+
+To check the cluster quality, we can again make a silhouette plot:
+```{r,fig.width=7,fig.height=6}
+si = silhouette(DBSCAN_groups, dist_eucl)
+plot(si, col = "darkgray", border=NA, main = "Silhouette plot for dbscan (euclidean in PCA space)")
+```
+
+Note that cluster 0 is not a real cluster but contains all outlier (unassigned) cells.
+
+Another way of checking cluster confidence is bootstrapping, which can be done using the `clusterboot` function form the `fpc` package:
+
+```{r}
+boot = fpc::clusterboot(data = dist_eucl, clustermethod = fpc::dbscanCBI, eps = 5.53,
+                         MinPts = 7,B = 100, distances = T, count=F, method = "dist",
+                        bootmethod = "boot")
+
+dt = melt(data.table(cluster = c(0:4), boot$bootresult),id.vars="cluster",val="jaccard index",var="boot number")
+dt = dt[cluster!=0]
+p = ggplot(dt, aes(x=as.factor(cluster),y=`jaccard index`)) + geom_boxplot() +theme_bw()
+print(p + ggtitle("Jaccard similarity between cluster assignment on the full data and on 100 bootstrap samples"))
+```
+
+Here, we see that the 3 large clusters are highly stable whereas the smallest cluster is not.
+
+### Model based clustering (Mclust)
+
+Mclust uses an EM algorithm to fit a gaussian mixture model to the data. The underlying assumption is that the data come from a mixture of k multivariate normal distributions. As this often does not hold in very high-dimensional space, we will run mclust on the PCA transformed data. Note that this dataset is not ideal for the algorithm, as its main advantage is speed and it tends to be more robust on datasets with more cells.
+
+The function _gmm_main_ is used to run the clustering. As input, we provide the following:
+
+* pc_scores: The scores obtained from a prcomp analysis
+* n_comp: The number of principal components to use. We will stick with 6.
+* k: The number of clusters to test. We will fit models with 1 to 10 clusters.
+* n_cores: The number of cores to be used in parallel computing. We set this to 1 for this small dataset.
+* return_model: If TRUE, returns the full mclust model object, not just the cluster assignments. Default = FALSE.
+
+`gmm_main` will run 10-fold cross-validation for each of the numbers of clusters we specified and in the end return the assignment using the model that achieves the highest likelihood while using the smallest number of clusters possible. Note that sometimes, the models fail to converge and the function returns `NA`.
+
+```{r}
+library(mclust)
+mclust_assignment = gmm_main(pc_scores = pca$x,n_comp=6, k=1:8,n_cores=1)
+```
+
+This plot shows the log-likelihood of all 10 models computed for each of the numbers of clusters. Note the initial steep increase in likelihood. The "best" number of clusters is the smallest one that achieves maximum likelihood (i.e. the number of clusters where the likelihood stops increasing).
+
+```{r}
+sce_info$mclust = as.factor(mclust_assignment)
+table(sce_info$mclust,sce_info$hclust_eucl)
+```
+
+Visualize on tSNE map:
+
+```{r, fig.width = 8}
+p = my_plot_tSNE(tsne = tsne_info, color = pData(sce_info)[,"mclust",drop=F],
+                 shape = pData(sce_info)[,"hclust_eucl",drop=F],
+                 title = "Mclust assignment",show_proportions = T)
+print(p)
+```
+
+We see that mclust found the larger clusters, but it has some trouble distinguishing the smaller ones. This is most likely because for small clusters, the estimation of the model parameters is more unreliable than for the larger clusters, and merging them with some larger cluster does not greatly affect the overall likelihood of the model.
+
+If we want to fit models for a user-defined number of clusters, we can do so by setting `do_crossval = FALSE` and providing the numer of clusters with the best_k parameter. Also, if we want to get the full mclust model object instead of just the cluster assignments, we can set `return_model = TRUE`:
+
+```{r, fig.width=8}
+mclust_model = gmm_main(pc_scores = pca$x,n_comp=6,do_crossval = F, best_k = 6, return_model = TRUE)
+sce_info$mclust_forced = as.factor(mclust_model$classification)
+
+table(sce_info$mclust_forced,sce_info$hclust_eucl)
+
+p = my_plot_tSNE(tsne = tsne_info, color = pData(sce_info)[,"mclust_forced",drop=F],
+                 shape = pData(sce_info)[,"hclust_eucl",drop=F],
+                 title = "Mclust assignment")
+print(p)
+```
+
+Now we can also bootstrap to get an idea of the uncertainty associated with each of the estimated model parameters:
+
+```{r,message=F,results="hide"}
+mclust_boot = MclustBootstrap(mclust_model, nboot=500)
+```
+```{r}
+summary(mclust_boot, what = "ci")
+```
+
+The mixing component tells us about the stability of cluster sizes. The confidence intervals for the mean and variance are measures of how stable the cluster position, shape and volume are. Note that for this type of model (VVI), all covariances are assumed to be 0. We can also plot the distributions of each parameter:
+
+```{r,fig.width=8, fig.height = 4}
+par(mfrow=c(1,6))
+plot(mclust_boot, what = "pro")
+```
+```{r, fig.width=8,fig.height=12}
+par(mfrow=c(6,6))
+plot(mclust_boot, what = "mean")
+par(mfrow=c(6,6))
+plot(mclust_boot, what = "var")
+par(mfrow=c(1,1))
+```
+
+Here, we see that overall, the clusters are fairly stable. Also note how the means become more and more unstable towards principal component 5 and 6, indicating that they are not too menaingful for the overall clustering.
+
+The main advantage of using mclust is that it is pretty fast and even works on datasets with ~40000 cells (I originally used the function here on the Drop-seq dataset by [Macosko et. al, 2015](http://www.sciencedirect.com/science/article/pii/S0092867415005498)) as it does not require calculating distance matrices. Moreover, the cross-validation provides an unsupervised way of determining the number of clusters present in the dataset. However, the downsides are that because the EM procedure is stochastic, outputs differ slightly each time mclust is run. Robustness might be achieved by running the algorithm several times and create a consensus clustering, similar to the procedure used by SC3. Moreover, mclust relies on distributional assumptions, therefore, if the clusters are not gaussian ellipsoids, mclust will not be able to identify them correctly.
+
+Save the SCESet that now contains all the assignments:
+
+```{r, eval = F}
+save(sce_info,file = file.path(out_data_dir,"sce_info.RData"))
+```
+
+### Clustering - Conclusion
+There is no universal best solution for clustering. Generally, if your data contains clear clusters that are well-separated in space, any method will work provided the underlying assumptions are fulfilled and the input (e.g. the measure of similarity) is meaningful.
+
+Regarding the choice of input parameters, SC3 is very neat as it does not require the user to make those decisions. Also, it is very well integrated in the scater workflow and comes with some nice additional tools, such as the automatic marker detection and several visualizations.
+
+Some of the main points you want to consider when choosing an algorithm:
+
+* The size of your data set: How much time and memory will each method need? 
+* Underlying assumptions: What cluster shapes and sizes does the method expect? Can it find clusters that are not well separated? 
+* Robustness: Is the method stochastic and will produce different output each time it is run? If the input changes slightly, how strongly will the clustering be affected?
+
+When choosing a distance measure, most methods benefit from dimensionality reduction. Therefore, I generally use distance (euclidean or pearson) calculated on principal component scores. Because each PC score is a weighted average of gene expression, this is also more robust to dropouts. As a rule of thumb for the number of components to use, make a screeplot and look where the "elbow" is.
+
+## Identifying (rare) cell subpopulations with CellSIUS
+
+CellSIUS (*Cell* *S*ubtype *I*dentification from *U*pregulated gene *S*ets ) was developed by Marilisa Neri. The underlying idea is to identify cluster-specific correlated gene sets that exhibit a bimodal distribution and then classify cells according to their expression of this gene set. 
+
+The parameters for this algorithm are as follows:
+
+* sce: The SCESet with all our data
+* group_id: A column name in pData() that specifies the cell assignment to main clusters. Here, we pretend we only found the 4 major groups and use the manual `cell_type` grouping. 
+* min_n_cells: The minimal number of cells per subcluster. Note: Main clusters that do not contain at least twice as many cells will be ignored.
+* verbose: Logical. Whether to print a summary or not.
+* min_fc: The minimum difference between the first and second mode of the bimodal gene distribution, on a log2 scale. The default is 2.
+distribution. 
+* fc_between_cutoff: Numeric, defaults to 1. Minimum difference [log2] in gene expression between cells in the subcluster and all other cells. The higher, the more cluster-specific the genes. Note that this should not be set higher than min_fc.
+* organism: Only relevant if verbose is `TRUE`. Specifies which genome annotation (human or mouse) to use when getting the gene descriptions.
+* iter: 0 or 1. If 1, when assigning the cells to subclusters, the first mode of the gene expression distribution is ignored. This results in a more stringent classification, at the risk of missing out true cell subtypes. The default is 0.
+* max_perc_cells: Numeric, between 0 and 100. Maximum percentage of cells per cluster that can be part of a subgroup. The default is 50, implying that it does not make sense to identify something as a "subgroup" if it contains more than half of the total observations.
+
+```{r, warning=F}
+sce_clean$cell_type = sce_info$cell_type
+cellsius_out = cellsius_main(sce_clean, group_id = "cell_type", min_n_cells = 5,
+                                 verbose =T, min_fc = 2, organism = "human", iter=0, 
+                                 max_perc_cells = 50, fc_between_cutoff = 1)
+```
+
+Because we set verbose to `TRUE`, the function printed a nicely human-readable summary. you can always re-print the summary using `cellsius_print_summary(cellsius_out)`. The same information can also be extracted from the output, let's have a look:
+
+```{r}
+cellsius_out
+```
+
+This looks quite confusing at first, so how do we get any information from here? Essentially, a data.table is a collection of key/value pairs. For example, the first row tells us that the cell with barcode `AAAGCAAGTCAAGCG` has an expression value of 0 for the gene `ENSG00000105374`. It also tells us that this cell is in the main cluster `T-cell`. There is a lot of additional information, but we will ignore this for now.
+
+If we want to know all the subclusters the cell `AAAGCAAGTCAAGCG` is a part of, we can do it as follows:
+
+```{r}
+unique(cellsius_out[cell_idx=="AAAGCAAGTCAAGCGA"]$sub_cluster)
+```
+
+This tells us that this cell is *not* a member of subcluster 1. Subclusters are named as follows:
+
+[Name-of-main-cluster]_[number of subcluster]_[0 or 1], where in the last position 0 means the cell is not a member, 1 means it is a member.
+
+If we want to know which genes are in a specific subcluster (here, I take T-cell 1), we can do so using the following query:
+
+```{r}
+unique(cellsius_out[sub_cluster == "T-cell_1_1"][,c('gene_id','symbol','description')])
+```
+
+Or, we might want to know how many cells are in each of the subclusters:
+
+```{r}
+cellsius_out[,length(unique(cell_idx)),by="sub_cluster"]
+```
+
+If you are not familiar with the `data.table` syntax, here's what we're doing in the above query:
+
+* we access a column variable (cell_idx) in the `data.table`
+* we apply a function to it
+* the last argument "by" specifies that we want to apply the function several times, namely for each unique value of `sub_cluster` (which is equivalent to looping over all clusters)
+
+To visualize the result on a t-SNE map, use the `plot_rare_cells` helper function:
+
+```{r}
+plot_rare_cells(rare=cellsius_out, tsne=tsne_info)
+```
+
+If you only want to look at one main cluster (here, this does not really make sense because there is only one subcluster anyway), just subset the `rare` table:
+
+```{r}
+plot_rare_cells(rare=cellsius_out[main_cluster=="T-cell"], tsne=tsne_info)
+```
+
+Or, maybe you only want to show the first T-cell subcluster:
+
+```{r}
+plot_rare_cells(rare=cellsius_out[sub_cluster=="T-cell_1_1"], tsne=tsne_info)
+```
+
+If you want to plot the expression of the identified markers on a tSNE map, there are two ways to do so. Manually:
+
+```{r, fig.width=8,fig.height=6}
+marker_idx = which(rownames(sce_clean)%in%cellsius_out[sub_cluster=='T-cell_1_1']$gene_id)
+
+plotlist = list()
+colors = t(norm_exprs(sce_clean)[marker_idx,,drop=F])
+colnames(colors) =  fData(sce_clean)$symbol[marker_idx]
+
+for(i in seq(dim(colors)[2])){
+  plotlist[[i]] = my_plot_tSNE(tsne = tsne_info,
+                      color = colors[,i,drop=F],
+                      alpha = 0.8, title = colnames(colors)[i]) + scale_color_distiller(palette = 'RdYlBu')
+}
+
+ggmultiplot(plotlist[[1]],plotlist[[2]],plotlist[[3]], plotlist[[4]],cols = 2)
+```
+
+Or, launch an interactive shiny app (currently, this is experimental):
+
+```{r, eval = F}
+library(shiny)
+launch_marker_vis_app(tsne = tsne_info, sce=sce_clean, marker_idx = marker_idx)
+```
+
+Here, we see that these markers are really specific to one sub-population of the T-cells. Expression of granzyme and NKG7 indicates that we re-identified the T-killer cell population. Note: We do not see CD8 here, because this gene is expressed at levels below our fold change (i.e. mean log expression difference) cutoff.
+
+To get a final cluster assignment, run `cellsius_final_cluster_assignment`:
+
+```{r}
+final_clusters = cellsius_final_cluster_assignment(cellsius_out, sce_clean, group_id = "cell_type", min_n_genes=3)
+
+table(final_clusters$cluster)
+
+p = my_plot_tSNE(tsne = tsne_info, color = final_clusters, title = "CellSIUS cluster assignment")
+print(p)
+```
+
+## Differential expression analysis
+The workflow contains wrapper functions for running differential expression analysis using several widely-used packages. For a comparison of methods, consider the recent study by Soneson and Robinson, which can be found [here](https://doi.org/10.1101/143289). 
+
+The main findings of the study are that methods differ in the number and characteristics of the genes they report as differentially expressed in a manner that is dependent on the respective dataset. Performance of the methods overall was found to be similar across methods, with those developed for bulk data not being significantly worse than those specifically designed for single-cell data.
+
+If we are interested in finding a small number of high-confidence marker genes, it might be most useful to run several methods and check what their overlap is. In general, I found the methods to be fairly consistent, especially for high expressed genes. For low expressed genes, results from any analysis should be taken with a grain of salt because of the very high underlying technical variability. Special care should be taken when comparing cell types that differ in size and/or RNA content and therefore have cell-specific dropout rates, in which case most low expressed genes are only detected in the large cells.
+
+Currently, wrappers to one non-parametric test (Wilcoxon/Mann-Whitney) and two methods based on linear models (limma, MAST) are provided.
+
+Every wrapper function takes the same four variables as input:
+
+* sce: the full SCESet after QC and normalization
+* cl_id: The name of the grouping that should be used. Here, we use the assignment obtained from hiererchical clustering on distances in PCA space, which we called "hclust_eucl".
+* cl_ref: Which cluster we want to compare against all the others. We select "B-cell". Note: If you wish to do a direct comparison between two clusters, you can do so by setting all assignments but the two you want to compare to `NA`, which for factors is very convenient using `droplevels()`.
+* fc_cutoff and alpha: The cutoffs for fold changes and p-values used to determine whether a gene is significantly DE. Note that your cutoffs have no effect on the analysis, and because the results for all genes are returned, you can still change the cutoffs afterwards.
+
+Before we can start, we need to add some of the cluster assignments we obtained in the previous section to the SCESet that contains all genes:
+
+```{r}
+sce_clean$SC3_assignment = sce_info$SC3_assignment
+sce_clean$hclust_eucl = sce_info$hclust_eucl
+```
+
+### Wilcoxon test
+We can run the Wilcoxon test using the `run_wilcoxon_test` wrapper function. This will take as input the above specified variables and return a `data.table` containing (adjusted) p-values and fold changes per gene.
+
+NOTE: The `pseudocount` parameter is deprecated and will be removed!
+
+```{r}
+de_wilcox = run_wilcoxon_test(sce_clean, cl_id = "hclust_eucl", cl_ref = "B-cell",
+                           fc_cutoff = 1, alpha = 0.05)
+dim(de_wilcox)
+head(de_wilcox)
+```
+
+We see that the function returned a `data.table` containing all gene IDs plus the test statistics and estimated fold changes for each of them. We can use the DE_flag entry to check how many genes were found to be significantly DE (i.e. adjusted p-value < 0.05 and absolute log2 fold change > 1).
+
+```{r}
+table(de_wilcox$DE_flag)
+```
+
+A useful way to check whether the method was biased towards calling genes in a specific expression range DE is to plot log2 fold changes v.s. the mean expression of a gene. We will add the mean_exprs column in the feature metadata to the `de_wilcox` table by using `merge` from the `data.table` package:
+
+```{r}
+mean_exprs_dt = data.table(gene_id = rownames(sce_clean),mean_exprs = fData(sce_clean)$mean_exprs)
+de_wilcox = merge(de_wilcox,mean_exprs_dt, by = "gene_id")
+names(de_wilcox)
+```
+
+We note that the mean_exprs column has been added to `de_wilcox`. Now we make a plot by calling `generic_scatterplot`. This function takes a `data.table` as input and makes a scatterplot of two columns, x_col and y_col, against each other. Optional column names can be provided to control color, shape and size of the points. The function returns a `ggplot` object, to which we can easily add other features, for example, a title:
+
+```{r}
+p = generic_scatterplot(de_wilcox, x_col = "mean_exprs", y_col = "log2fc",
+                        color = "DE_flag")
+print(p+ggtitle('MA plot for Wilcoxon test'))
+```
+
+We see that because fold changes are estimated as the difference in log2 mean expression rather than a ratio, very low expressed genes have fold changes around zero.
+
+To make a volcano plot, we can again use `generic_scatterplot`:
+```{r}
+de_wilcox[,log10_pval:=-log10(adj_pval)]
+p = generic_scatterplot(de_wilcox, x_col = "log2fc", y_col = "log10_pval",
+                        color = "DE_flag")
+print(p+ggtitle('Volcano plot for Wilcoxon test'))
+```
+
+Note: In general, the more cells you have, the more tiny changes will become significant. The `DE_flag` parameter is therfore controlled mostly by your fold change cutoff, unless you set a very stringent p-value cutoff (~10^-20). It is probably best to use the fold change / p-value combination more as a way of ranking genes than as an absolute threshold and focus on the genes that come out on top.
+
+Now let's check whether the identified genes make sense:
+
+```{r,message=F}
+library(DT)
+top_DE = de_wilcox[DE_flag==TRUE][order(log2fc,decreasing = T)]$gene_id[1:20]
+gene_table = get_gene_annotations(top_DE,get_descriptions = T)
+datatable(gene_table, caption = "Top 20 upregulated genes in B-cells")
+```
+
+And we are happy to see that the top upregulated genes correspond to known B-cell markers such as CD79 or MHCII subunits.
+
+### limma
+Limma was originally developed for bulk RNA-seq data, but in most cases, it also performs fairly well on single-cell data. However, especially the voom version can become unreliable in the presence of many zero counts, therefore, it is recommended to filter out low-abundant genes prior to running the analysis. In the following, we will run both limma-voom and limma-trend and compare their outputs.
+
+The function `run_limma` is used for both methods. In addition to the standard input described above, we need to provide the following inputs:
+
+* method: which limma method we want to use. 
+* count_thr, pct: Threshold for gene filtering. Genes that do not have a minimum of `count_thr` counts in at least `pct` percent of cells in at least one cluster will be ignored. For this extremely sparse data, we set this to 1.
+
+```{r}
+de_limma_voom = run_limma(sce_clean, cl_id = "hclust_eucl", cl_ref = "B-cell",
+                          method = "voom", fc_cutoff = 1, alpha = 0.05, count_thr = 1,pct=50)
+```
+
+Looking at the voom plot, we should be a bit suspicious. The heel at the left side of the plot indicates that there are still a lot of zero counts, and our filtering may not have been very succesful. Let's have a look at the output: 
+
+```{r}
+dim(de_limma_voom)
+names(de_limma_voom)
+```
+
+We see that, like the `run_wilcoxon_test`, this function returned a `data.table`. note that because of the filtering, the limma table only contains 3012 gene IDs plus the limma test statistics for each of them. We can again use the DE_flag entry to check how many genes were found to be significantly DE (i.e. adjusted p-value < 0.05 and absolute log2 fold change > 1) and also compare this to the Wilcoxon test:
+
+```{r}
+table(de_limma_voom$DE_flag)
+table(de_wilcox[de_limma_voom$gene_id,on="gene_id"]$DE_flag,de_limma_voom$DE_flag)
+```
+
+We see that of the genes that are within the set tested by limma, all 35 genes identified to be DE by the Wilcoxon test were also identified by limma. This is not very surprising, because again, the decision to cal a gene DE is mainly based on fold change.
+
+Make an MA plot for limma-voom:
+
+```{r}
+de_limma_voom = merge(de_limma_voom,mean_exprs_dt, by = "gene_id")
+names(de_limma_voom)
+
+p = generic_scatterplot(de_limma_voom, x_col = "mean_exprs", y_col = "logFC",
+                        color = "DE_flag")
+print(p+ggtitle('MA plot for limma-voom'))
+```
+
+We see that there is only a slight bias towards very low expressed genes. Keep in mind, however, that we already filtered out ~70% of all the genes before running the analysis. Let's see what happens if we omit the filtering:
+
+```{r}
+
+voom_no_filt = run_limma(sce_clean, cl_id = "hclust_eucl", cl_ref = "B-cell",
+                          method = "voom", fc_cutoff = 1, alpha = 0.05, count_thr = 0)
+voom_no_filt = merge(voom_no_filt, mean_exprs_dt)
+p = generic_scatterplot(voom_no_filt, x_col = "mean_exprs", y_col = "logFC",
+                        color = "DE_flag")
+
+print(p+ggtitle("MA plot for limma-voom, no filtering"))
+
+table(voom_no_filt[DE_flag==TRUE]$gene_id%in%de_limma_voom[DE_flag==TRUE]$gene_id)
+```
+
+For this dataset, limma-voom remains stable and finds the same number of DE genes, even if we don't filter. In some cases, however, the method can fail and produce a mean v.s. log FC plot that is shifted along the y-axis, looking somewhat like this:
+
+```{r}
+example_dt = copy(voom_no_filt)
+example_dt[,logFC:=logFC-1*1/(mean_exprs+1)]
+example_dt[,DE_flag := adj.P.Val < 0.05 & abs(logFC)>1]
+p = generic_scatterplot(example_dt, x_col = "mean_exprs", y_col = "logFC",
+                        color = "DE_flag") + geom_hline(yintercept = 0)
+print(p+ggtitle("An example of an MA plot for limma gone wrong"))
+
+```
+
+We can see that in this case, many low expressed genes would be falsely called DE. It is therfore always a good idea to inspect the output of any differential expression analysis, as each method has its own biases and cases in which it fails.
+
+To run limma-trend, we use exactly the same code, but set method = "trend":
+
+```{r}
+de_limma_trend = run_limma(sce_clean, cl_id = "hclust_eucl", cl_ref = "B-cell",
+                          method = "trend", fc_cutoff = 1, alpha = 0.05, count_thr = 1, pct=50)
+
+de_limma_trend = merge(de_limma_trend, mean_exprs_dt)
+de_limma_trend[,voom_overlap:=de_limma_trend$DE_flag == de_limma_voom$DE_flag]
+
+p = generic_scatterplot(de_limma_trend, x_col = "mean_exprs", y_col = "logFC",
+                        color = "DE_flag", shape = "voom_overlap")
+
+print(p + ggtitle("MA plot for limma-trend"))
+
+table(de_limma_trend$DE_flag,de_limma_voom$DE_flag)
+table(de_wilcox[de_limma_trend$gene_id,on="gene_id"]$DE_flag,de_limma_trend$DE_flag)
+
+# Compare p-values between Wilcoxon test and limma
+ggplot(data.table(wilcox = de_wilcox[de_limma_trend$gene_id,on="gene_id"]$pval,
+                  limmatrend = de_limma_trend$P.Val),
+       aes(x=-log10(wilcox),y=-log10(limmatrend)))+geom_point()+theme_bw()+
+  ggtitle('Comparison of p-values between limmatrend and Wilcoxon test')
+```
+
+Limma-trend finds exactly the same genes as the wilcoxon test, probably because the way fold changes are estimated is the same and we filter mainly based on fold changes. Comparing the p-values, limma-trend and the Wilcoxon test still agree very well.
+
+### MAST
+MAST is a framework designed for single-cell data that is based on a zero-inflated negative binomial model. A hurdle model is used to estimate differetial expression by jointly modeling discrete (cellular detection rates, zero v.s. non-zero values) and continuous (positive mean expression) values. For more information, see the [MAST paper](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC4676162/) or the [package vignette](http://bioconductor.org/packages/release/bioc/vignettes/MAST/inst/doc/MAITAnalysis.html).
+
+MAST ususally has run times similar to limma. However, I found that it often freezes on the barolo and mithril rstudio server, probably this has something to do with the versios of BLAS/LAPACK on these systems. You might therefore want to run MAST from command line or on the other rstudio server. 
+
+We can run MAST using the `run_MAST` wrapper that works analogous to the two methods previously described. We provide the following additional parameters:
+
+* set_thresh: Should MAST try to find expression thresholds? We will initially set this to TRUE, and check the thresholds on the output plot. If we cannot see a clear bimodal distribution of counts, we should set this to FALSE. The thresholding also takes the optional `min_per_bin` and `n_bins` arguments, which we will leave at their defaults for now.
+
+* norm: use normalized values? Set to TRUE.
+* n_cores: number of cores to use for parallel computing.
+
+```{r, message = F}
+de_MAST = run_MAST(sce_clean,cl_id = "hclust_eucl",cl_ref = "B-cell",norm=T,
+                   set_thresh=T,fc_cutoff = 1, alpha=0.05)
+```
+
+We clearly see that the thresholds are pretty random as for most bins, no clear bimodal distribution is visible. Therefore, we re-run MAST setting `set_thresh = FALSE`:
+
+```{r, message = F}
+de_MAST = run_MAST(sce_clean,cl_id = "hclust_eucl",cl_ref = "B-cell",norm=T,
+                   set_thresh=F,fc_cutoff = 1, alpha=0.5)
+```
+
+Again, let's make a plot and compare to limma-trend and DESeq2:
+
+```{r,fig.width=10}
+de_MAST = merge(de_MAST, mean_exprs_dt)
+
+p = generic_scatterplot(de_MAST, x_col = "mean_exprs", y_col = "log2FC",
+                        color = "DE_flag")
+print(p+ggtitle("MA plot for MAST"))
+
+table(de_MAST$DE_flag)
+table(de_MAST[de_limma_trend$gene_id,]$DE_flag,de_limma_trend$DE_flag)
+
+# Compare p-values between MAST and limma
+ggplot(data.table(MAST = de_MAST[de_limma_trend$gene_id,on="gene_id"]$pval,
+                  limmatrend = de_limma_trend$P.Val),
+       aes(x=-log10(MAST),y=-log10(limmatrend)))+geom_point()+theme_bw()+
+  ggtitle('Comparison of p-values between limmatrend and MAST')
+```
+
+We see that MAST performs similar to the other methods we used.
+
+Finally, we can check the overlap of all the methods we tested:
+
+```{r,fig.width=10, eval = T}
+merged = merge(de_MAST,
+               de_limma_trend[, c("gene_id","DE_flag"),with=F],
+               by = "gene_id",all=T)
+merged = merge(merged, de_wilcox[,c("gene_id","DE_flag"),with=F],by="gene_id",all=T)
+
+setnames(merged,which(grepl("DE_flag",names(merged))),paste0("DE_flag_",c(1:3)))
+merged[,overlap:=factor(DE_flag_1==T & DE_flag_2==T & DE_flag_3==T, labels =c("Not DE or not found by all methods","Overlap of all methods"))]
+
+p = generic_scatterplot(merged, x_col = "mean_exprs", y_col = "log2FC", color = "overlap" )
+print(p+ggtitle("Overlap between all methods tested") + ylab("log2FC (MAST)"))
+```
+
+Form this, we conclude that the top DE genes are ceonserved between methods, whereas the ones with lower expression or close to the seleceted cutoffs differ between methods. 
+
+Once we identified a core set of high confidence genes, we could look for additional markers by looking for genes that are highly correlated with the identified markers or by clustering the genes according to their expression pattern across cells. 
+
+### Using SC3 to find markers
+
+This sections shows how to tweak the `sc3_calc_biology` function to work with any arbitrary clustering.
+
+```{r, eval = T, message = F}
+library(SC3)
+
+# add the slots the calc biology function checks
+dummy = list(`0`=0)
+sce_clean@sc3$consensus = dummy
+sce_clean@sc3$n_cores = 4
+fData(sce_clean)$sc3_gene_filter = rep(TRUE,dim(sce_clean)[1]) #do not filter out any genes
+
+# add whatever clustering assignment you want to the sc3_0_clusters slot
+sce_clean$sc3_0_clusters = as.factor(sce_info$cell_type) 
+
+sce_clean = sc3_calc_biology(sce_clean, k = 0)
+```
+
+Plot markers:
+
+```{r, out.width="110%",fig.height=6}
+# change the plotted gene names to symbol for better readability
+plot_sce = sce_clean[!is.na(fData(sce_clean)$symbol),]
+rownames(plot_sce) = fData(plot_sce)$symbol
+custom_sc3_plot_markers(plot_sce, k=0, p.val = 0.01, auroc = 0.90, show_pdata='sc3_0_clusters')
+```
+
+
+### Differential expression analysis - Conclusion
+We saw that the high-confidence (highly expressed and large fold changes) DE genes are the same across all methods used, which is not surprising. All methods find a large number of significant hits (this becomes even more apparent in larger datasets), therefore the main criterion for calling a gene DE is its fold change. Instead of setting fixed thresholds, it might be more useful to just rank the genes according to fold change and p-value and focus on those that come out on top.
+
+The Wilcoxon test or limma are definitely the methods of choice in terms of speed. However, note that the Wilcoxon test will become unreliable for very small (< 10 cells) groups. 
+
+For limma, especially limma-voom can be unreliable in the presence of many zero counts. Filtering may help, but it is not guaranteed. Therefore, if you use limma, always check the MA-plot. If it is shifted along the y-axis, be more stringent in your filtering or choose a different method.
+
+MAST, like limma, is based on a linear modelling framework, making it very flexible. In addition, it is tailored to single-cell data and very robust on sparse data. Another plus of MAST is that it is quite fast and scales quite well even to very large datasets. 
+
+## Functions
+This section lists all custom functions that are part of the workflow. These are equivalent to everything that is provided in the ./code directory, therefore this section is merely for documentation purposes.  
+
+### Libraries required throughout the analysis
+
+The function _library_calls()_ calls all the libraries that are required throughout the workflow. Additional packages are loaded whenever needed. The reason for this is that some of the newer bioconductor packages load a million dependencies, and currently, R has a limit on how many packages can be loaded at any time.
+
+```{r}
+library_calls = function(){
+  library(Rtsne) 
+  library(ggplot2)
+  library(data.table)
+  library(scater)
+  library(scran)
+  library(RColorBrewer)
+}
+```
+
+### Gene annotation
+
+#### Gene annotation using ensembldb
+This is the default function to annotate genes. It uses the ensembldb and EnsDb.Hsapiens.v79 packages. Ensembldb is preferred over biomaRt because it is much faster and it uses a specific annotation package, making it more reproducible. Optionally, gene descriptions in human-readable form are obtained from org.Hs.eg.db.
+
+Input:
+
+* gene_list = a list of ensembl gene IDs as a character vector
+* get_descriptions = should descriptions be obtained from org.Hs.eg.db/org.Mm.eg.db? TRUE or FALSE. Note that this is slow for a long gene list.
+* v = verbose flag. If set to true, prints all the errors that my_get() catches. Should be set to true only for debugging purposes.
+* organism: one of either "mouse" or "human"
+
+Output: 
+
+* geneName = a data.table of gene annotations. Note that this table is sorted by gene identifier.
+
+```{r}
+get_gene_annotations = function(gene_list,v=F,get_descriptions=T,organism = "human"){
+  library(ensembldb)
+  if(organism == "human"){
+    library(EnsDb.Hsapiens.v79)
+    edb = EnsDb.Hsapiens.v79
+  } else if(organism == "mouse"){
+    library(EnsDb.Mmusculus.v75)
+    edb = EnsDb.Mmusculus.v75
+  } else {stop("Currently, annotation is only available for organisms human or mouse.")}
+  
+  my_get = function(x,db,v){
+    out = tryCatch({get(x,db)[1]},
+                   error = function(cond){
+                     if(v) {message(cond)}
+                     return("")},
+                   finally = {})
+    return(out)
+  }
+  
+  gene_info = ensembldb::genes(edb,filter = list(GeneIdFilter(gene_list)))
+  gene_info_dt = data.table(gene_id = names(gene_info),
+                            chr = as.character(seqnames(gene_info)),
+                            symbol = make.unique(gene_info$symbol),
+                            gene_biotype = gene_info$gene_biotype)
+  
+  geneName = data.table(gene_id = gene_list)
+  geneName = merge(geneName,gene_info_dt,by="gene_id",all=T)
+  
+  if(get_descriptions & organism == "human"){
+    library(org.Hs.eg.db)
+    geneName[,eg:=my_get(gene_id,db=org.Hs.egENSEMBL2EG,v),by="gene_id"]
+    geneName[,description:=my_get(eg,db=org.Hs.egGENENAME,v),by="eg"]
+  } else if(get_descriptions){
+    library(org.Mm.eg.db)
+    geneName[,eg:=my_get(gene_id,db=org.Mm.egENSEMBL2EG,v),by="gene_id"]
+    geneName[,description:=my_get(eg,db=org.Mm.egGENENAME,v),by="eg"]
+  }
+  return(geneName)
+}
+```
+
+#### Gene annotation using biomaRt
+Gene annotations can also be retrieved from biomaRt, however, ensembldb is preferred for the above mentioned reasons.
+
+```{r}
+
+get_gene_annotations_biomart = function(gene_list){
+  library(biomaRt)
+  # Load the organism-specific biomart
+  ensembl  =  biomaRt::useEnsembl(
+    biomart = 'ensembl', 
+    dataset = paste0('hsapiens', '_gene_ensembl'),
+    version = 83
+  )
+  #
+  geneName  =  biomaRt::getBM(attributes = c('ensembl_gene_id','hgnc_symbol', 
+                                            "entrezgene", "description","chromosome_name"), 
+                             filters = 'ensembl_gene_id',
+                             values = gene_list, 
+                             mart = ensembl)
+  
+  description = lapply(seq(length(geneName$description)),function(i){
+    strsplit(geneName$description[i],"[[]")[[1]][1]
+  })
+  description = (unlist(description))
+  geneName$description = description
+  colnames(geneName) = c('gene_id','symbol','eg','description','chr')
+  geneName = data.table(geneName)
+  setkey(geneName,'gene_id')
+  geneName = unique(geneName) #remove duplicate entrez gene identifiers
+  geneName[,symbol:=make.unique(symbol)]
+  #save(geneName,file="data/output/geneName.RData")
+  return(geneName)
+}
+```
+
+### Quality control
+#### Filtering of genes and cells
+The functions below are used for manual filtering of cells and genes based on several QC metrics. 
+
+Input:
+
+* counts: Matrix of raw counts.
+* n_th: A single number specifying the cutoff for the respective filter. In the gene filter, this is the minimal number of cells with counts above `min_counts`. In the feature_counts and n_UMI filters, this is the minimal number of total counts or total UMIs, respectively, per cell.
+* min_counts: In the gene filter, this specifies the minimum number of counts. The filter removes genes that do not have at least `min_counts` counts in at least `n_th` cells.
+* mt_genes.amount: a vector containing the percentage of mitochondrial genes per cell. This information is stored in sce$percent_feature_controls_MT.
+* t: a single number specifying the maximum percentage of reads mapped to mitochondrial genes.
+
+
+```{r}
+#_____________
+# Gene filters
+#___________
+
+# Filtering out genes that are not expressed at a minimum of min_counts in at least n_th cells
+gene_filter_by_feature_count = function(counts, n_th , min_counts = 1){
+  discard = rowSums(counts>=min_counts) <= n_th
+  message(paste('Flagged', length(which(discard)), 'genes.'))
+  return(discard)
+}
+
+#______________
+# Cell filters
+#______________
+
+# Filtering out cells with fewer than n_th detected features
+cell_filter_by_feature_count = function(counts, n_th){
+  discard = colSums(counts>0) <= n_th
+  message(paste('Flagged', length(which(discard)), 'cells.'))
+  return(discard)
+}
+
+# Filtering out cells with fewer than n_th total UMI counts
+cell_filter_by_total_UMI = function(counts, n_th){
+  discard = colSums(counts) <= n_th
+  message(paste('Flagged', length(which(discard)), 'cells.'))
+  return(discard)
+}
+
+# Filtering out cells with high mitochondrial gene content
+calc_mt_content = function(counts, geneName){
+  mt = rownames(counts[rownames(counts) %in% rownames(geneName[geneName$chromosome_name=="MT",]),])
+  mt_not = setdiff(rownames(counts),rownames(counts[mt,]))
+  counts_mt = counts[mt,]
+  mt_genes.amount = 100/colSums(counts)*colSums(counts[mt,])
+  return(mt_genes.amount)
+}
+
+cell_filter_by_mt_content = function(mt_genes.amount, t){
+  discard = mt_genes.amount > t
+  message(paste('Flagged', length(which(discard)),'cells.'))
+  return(discard)
+}
+```
+
+#### Visualizing the manual filters
+Input:
+
+* sce, input_sce: an SCESet from which the things to plot are taken
+* min_genes, min_UMI, t: the cutoffs selected for minimum number of genes per cell [log2], minimum number of UMIs per cell [log2], and maximum percentage of mitochondrial genes
+
+```{r}
+# Plotting QC based on RNA amount detected per cell
+plot_RNA_QC = function(input_sce, min_genes, min_UMI){
+  par(mfrow=c(1,3))
+  hist(log2(input_sce$total_features),xlab="log2[ # detected genes per cell]", main='', cex.axis=1.5,n=100)
+  abline(v=min_genes,col=2)
+  hist(log2(input_sce$total_counts),xlab="log2 [# of UMIs per cell]", main='', cex.axis=1.5,n=100)
+  abline(v=min_UMI,col=2)
+  plot(log2(input_sce$total_features),log2(input_sce$total_counts),xlab="log2[ # detected features per cell]",ylab="log2 [total counts per cell]", cex.axis=1.5)
+  abline(v=min_genes,col=2)
+  abline(h=min_UMI,col=2)
+}
+
+# Plotting mitochondrial gene QC
+plot_MT_QC = function(sce, t){
+  par(mfrow=c(1,1))
+  mt_genes.amount = sce$pct_counts_feature_controls_MT 
+  #mt gene content per cell
+  plot(seq(length(mt_genes.amount)),(mt_genes.amount),pch=10,cex=1.5,col="gray",main=""
+       , cex.axis=2,cex.lab=1.5,xlab="cell index",ylab="Ratio of MT-genes[%]")
+  points(seq(length(mt_genes.amount))[mt_genes.amount<t],mt_genes.amount[mt_genes.amount<t],pch=10,cex=1.5)
+  abline(h=t,col="red",lty=2,cex=5)
+  
+  #UMI vs no. genes colored by mt gene content
+  plotPhenoData(sce, aes_string(x = "log2(total_features)",
+                                y = "log2(total_counts)",
+                                colour = "pct_counts_feature_controls_MT"))+
+    xlab("Total detected features [log2]") + ylab("Total counts [log2]")+
+    ggtitle("Total features vs. total counts, colored by MT content")
+}
+
+```
+
+#### Cell cycle assignment
+
+Using the cyclone function from scran:
+
+```{r}
+annotate_cell_cycle = function(sce, organism = "human", gene.names = rownames(sce)){
+  if(organism == "human"){
+    hs.pairs = readRDS(system.file("exdata", "human_cycle_markers.rds", package="scran"))
+    assigned = cyclone(sce, pairs=hs.pairs, gene.names = gene.names)} else if (organism == "mouse"){
+      mm.pairs = readRDS(system.file("exdata", "mouse_cycle_markers.rds", package="scran"))
+      assigned = cyclone(sce, pairs=mm.pairs, gene.names = gene.names)
+    } else {stop("Organism has to be human or mouse.")}
+  
+  return(assigned)
+}
+```
+
+Using annotations from cyclebase:
+
+```{r}
+annotate_cell_cycle_custom = function(log2_counts, organism = "human", input_dir = file.path(code_dir, "input_files")){
+  
+  # Load list of cell-cycle genes from cyclebase
+  load(file.path(input_dir,"cell.cycle.gene.RData"))
+  head(cell.cycle.gene)
+  
+  #plot(sort(cell.cycle.gene$periodicity_pvalue))
+  cc = cell.cycle.gene[which(cell.cycle.gene$periodicity_pvalue<.05),]
+  # 220/361 genes are a subset of the variable gene list of our dataset
+  if(organism == "human"){
+    cc =  cc[cc$Ensembl.Gene.ID %in% rownames(log2_counts),] 
+    
+    # selecting genes associetes with cell-cycle phase
+    G1.genes = cc[which(cc$peaktime>0 & cc$peaktime<47 ),]$Ensembl.Gene.ID
+    S.genes = cc[which(cc$peaktime>47 & cc$peaktime<70 ),]$Ensembl.Gene.ID
+    G2.genes = cc[which(cc$peaktime>70 & cc$peaktime<90 ),]$Ensembl.Gene.ID
+    M.genes = cc[which(cc$peaktime>90 & cc$peaktime<100 ),]$Ensembl.Gene.ID
+    
+    G1_S.genes = cc[which(cc$peaktime>40 & cc$peaktime<50 ),]$Ensembl.Gene.ID
+    S_G2.genes = cc[which(cc$peaktime>60 & cc$peaktime<70 ),]$Ensembl.Gene.ID
+    G2_M.genes = cc[which(cc$peaktime>80 & cc$peaktime<90 ),]$Ensembl.Gene.ID
+    
+  } else if(organism == "mouse"){
+    cc =  cc[cc$Ensembl.Gene.ID.1 %in% rownames(log2_counts),] 
+    # selecting genes associetes with cell-cycle phase
+    G1.genes = cc[which(cc$peaktime>0 & cc$peaktime<47 ),]$Ensembl.Gene.ID.1
+    S.genes = cc[which(cc$peaktime>47 & cc$peaktime<70 ),]$Ensembl.Gene.ID.1
+    G2.genes = cc[which(cc$peaktime>70 & cc$peaktime<90 ),]$Ensembl.Gene.ID.1
+    M.genes = cc[which(cc$peaktime>90 & cc$peaktime<100 ),]$Ensembl.Gene.ID.1
+    
+    G1_S.genes = cc[which(cc$peaktime>40 & cc$peaktime<50 ),]$Ensembl.Gene.ID.1
+    S_G2.genes = cc[which(cc$peaktime>60 & cc$peaktime<70 ),]$Ensembl.Gene.ID.1
+    G2_M.genes = cc[which(cc$peaktime>80 & cc$peaktime<90 ),]$Ensembl.Gene.ID.1
+  } else { stop ("Organism has to be either human or mouse")}
+  
+  
+  # Compute the smean of genes associated with each cell-phase
+  G1.sum = apply(log2_counts[G1.genes,colnames(log2_counts)],2,mean)
+  S.sum = apply(log2_counts[S.genes,colnames(log2_counts)],2,mean)
+  G2.sum = apply(log2_counts[G2.genes,colnames(log2_counts)],2,mean)
+  M.sum = apply(log2_counts[M.genes,colnames(log2_counts)],2,mean)
+  G1_S.sum = apply(log2_counts[G1_S.genes,colnames(log2_counts)],2,mean)
+  S_G2.sum = apply(log2_counts[S_G2.genes,colnames(log2_counts)],2,mean)
+  G2_M.sum = apply(log2_counts[G2_M.genes,colnames(log2_counts)],2,mean)
+  
+  # Create a matrix with the sum of genes associated with each cell-cycle pahse per cells
+  G1.S.G2.M = rbind(G1.sum[names(sort(G1.sum))],S.sum[names(sort(G1.sum))],
+                   G2.sum[names(sort(G1.sum))] ,
+                   M.sum[names(sort(G1.sum))],G1_S.sum[names(sort(G1.sum))],
+                   S_G2.sum[names(sort(G1.sum))],G2_M.sum[names(sort(G1.sum))]) 
+  
+  rownames(G1.S.G2.M) = c("G1","S","G2","M","G1_S","S_G2","G2_M")
+  
+  
+  # compute a cell cycle score (divide by totl expression)
+  # note that this is biased by expression differences in cc genes,
+  # better to use correlations as in Seurat or scran
+  cell.phase = do.call(cbind,
+                      lapply(seq(dim(G1.S.G2.M)[2]),function(i){
+                        res = G1.S.G2.M[,i]/sum(G1.S.G2.M[,i])
+                      }))
+  colnames(cell.phase) = colnames(G1.S.G2.M)
+  cell.phase = t(cell.phase)
+  cell.phase = as.data.frame(cell.phase)
+  cell.phase = as.data.frame(t(cell.phase),stringsAsFactors = F)
+  return(cell.phase)
+}
+```
+
+### Normalization
+All available normalizations are collapsed in a single function `normalize_counts` for convenience. 
+
+Input:
+
+  * sce: SCESet. Contains all your data.
+  * method: Character. The method you want to use to normalize. Choices are:
+    + TC = total count normalization (multiply this by 10^6 to get CPMs)
+    + UQ = upperquartile
+    + RLE = relative log-expression, as in DESeq2
+    + TMM = trimmed mean of M-values, as in edgeR
+    + scran (default) = Lun sum factors, implemented in scran package
+
+Output:
+
+ * an SCESet with the normalized expression values in the exprs and norm_exprs slots 
+ 
+```{r}
+normalize_counts = function(sce,method = "scran"){
+  #calculate size factors according to method
+  switch(method,
+         "TC" ={sce = normalizeExprs(sce, method="none",return_norm_as_exprs=T)},
+         "RLE" = {sce = normalizeExprs(sce, method="RLE",return_norm_as_exprs=T)},
+         "TMM" = {sce = normalizeExprs(sce, method="TMM",return_norm_as_exprs=T)},
+         "UQ" = {sce = normalizeExprs(sce, method="upperquartile",return_norm_as_exprs=T)}, 
+         "scran" = {clusters = quickCluster(sce)
+         sizes = seq(20,100,5)
+         if(min(table(clusters))>max(sizes)){
+           sce = computeSumFactors(sce,clusters = clusters,sizes=sizes)
+         } else{
+           message("Clustering of cells failed, using global scaling factors")
+           sce = computeSumFactors(sce)
+           if(any(sizeFactors(sce) < 0)) {
+             warning("Negative size factors generated. Most likely, this is due to some cells having very low total feature counts. Consider using more stringent QC cutoffs.")
+           }
+         }
+         sce = scater::normalize(sce, return_norm_as_exprs=T)}
+  )
+  return(sce)  
+}
+```
+
+### Feature selection
+
+#### Highly variable genes (Brennecke et. al, 2013)
+This method implements the approach presented by Brennecke et. al, NMeth, 2013 ([here](http://www.nature.com/nmeth/journal/v10/n11/full/nmeth.2645.html?foxtrotcallback=true)).
+
+Input:
+
+* x: a matrix of normalized counts, NOT on log scale. Note that therefore you will need to provide 2^norm_exprs(SCESet)-1 if your input comes from an SCESet.
+* PLOT: logical. Should a plot be printed?
+* qcv: Between 0 and 1. Threshold for the coefficient of variation (see below). 
+* q: Between 0 and 1. The q-th quantile of the mean expression of all genes having a CV > qcv is used as a threshold. Genes having mean below this threshold are not included in the analysis.
+* pv: the p-value cutoff
+* minBiolDisp: Between 0 and 1. The CV of the underlying biological variation. Leave at default unless you have a good reason to change it.
+
+Output:
+
+ * info: a vector of logicals specifying whther a gene is informative or not. 
+ 
+```{r}
+info.genes = function(x,PLOT=F,qcv=.3,pv=.05,q=.95,minBiolDisp=0.1, perc_genes = NULL){
+  
+  if(!(is.null(perc_genes)|is.null(pv))){
+    stop("Please provide either pv or perc_genes, not both!")
+  }
+  library(statmod)
+  
+  # calculate mean, variance and CV
+  means  = rowMeans(x)
+  vars  =  (apply(x,1,var))
+  cv2 = vars/means^2
+  
+  # exclude genes with very low mean
+  minMeanForFit  =  unname( quantile( means[ which( cv2 > qcv) ], q ) )#is the 95% of the means with a dispersion greter than 0.3
+  useForFit  =  means >= minMeanForFit
+  
+  #fit model
+  fit  =  glmgam.fit( cbind( a0 = 1, a1tilde = 1/means[useForFit] ),cv2[useForFit] ) # linear fit
+  fit$coefficients
+  
+  a0 = unname(fit$coefficients["a0"])
+  a1 = unname(fit$coefficients["a1tilde"]) #we assume xi = mean(technical size factors) = 0
+  minBiolDisp = minBiolDisp^2 #squared minimum biological variance
+  psia1theta = a1 # this is the term psi+a1*theta that appears in the formula for omega
+  # again, we assume that the technical sf = 0 and mean ratio of all size factors = 1
+  m  =  ncol(x)
+  cv2th  =  a0 + minBiolDisp + a0 * minBiolDisp #a0 adjusted for min biol variation
+  testDenom  =  ( means * psia1theta + means^2 * cv2th ) / ( 1 + cv2th/m ) #omega
+  
+  pval  =  pchisq(vars*(m-1)/testDenom,df=m-1,lower.tail=F) #Chi^2 distribution
+  adj.pval  =  sort(p.adjust(pval,"fdr"))
+  
+  if(!is.null(pv)){
+    info = adj.pval < pv
+  } else {
+    info = adj.pval < adj.pval[as.integer(perc_genes/100*length(adj.pval))]
+  }
+  
+  if(PLOT){
+    if(min(means)<=0) ps = .1-min(means)
+    if(min(means)>0)  ps = 0
+    xg  =  1000^(seq( min(log(means+ps)), max(log(means+ps)), length.out=5000 ))
+    
+    vfit  =  a1/xg + a0 #estimated technical variation
+    vfit_biol = psia1theta/xg + a0 + minBiolDisp # expected total variation
+    
+    xlabel = "log[ Average normalized read count]"
+    smoothScatter(log(means+ps),log(cv2),xlab=xlabel,ylab="log[ Squared coefficient of variation (CV^2)]")
+    points(log(means+ps),log(cv2),col="gray")
+    # lines(log(xg[which(vfit>0)]+ps), log(vfit[which(vfit>0)]), col="black", lwd=3,lty=2,ylim=range(cv2) )
+    lines(log(xg[which(vfit_biol>0)]+ps), log(vfit_biol[which(vfit_biol>0)]), col="black", lwd=3,ylim=range(cv2) )
+    lines(log(xg[which(vfit_biol>0)]+ps),log(vfit_biol[which(vfit_biol>0)] * qchisq(0.975,m-1)/(m-1)),lty=2,col="black")
+    lines(log(xg[which(vfit_biol>0)]+ps),log(vfit_biol[which(vfit_biol>0)] * qchisq(0.025,m-1)/(m-1)),lty=2,col="black")
+    points(log(means[names(which(info)[TRUE])]+ps),log(cv2[names(which(info)[TRUE])]),col=2,cex=.5)
+    
+  }
+  
+  return(info)
+}
+
+```
+
+#### Using depth-adjusted negative binomial model (M3Drop)
+This method is implemented in M3drop versions > 2.0. It models the gene counts as a negative binomial with a depth-adjusted mean. Gene-specific dispersions are then fit to the sample variance. A detailed description of the method can be found [here](https://www.biorxiv.org/content/early/2016/10/20/065094). Based on the calculated model, informative genes can be selcted by comparing expected values for dropouts (NBDrop) or dispersions (NBDisp) to the predicted ones.
+
+The function _run_DANB_ is used for both methods.
+
+Input:
+
+* counts: a matrix of RAW counts
+* save_plot: logical. Should the produced plot be saved?
+* method: One of either "NBDrop" or "NBDisp". The method used for feature selection.
+* cutoff: The p-value cutoff for NBDrop or the percentage of genes returned by NBDisp.
+* perc_genes: The percentage of genes to keep (can only be provided instead of cutoff)
+
+Output:
+
+*  info: a vector of logicals specifying whther a gene is informative or not. 
+
+```{r}
+run_DANB = function(counts,save_plot=T,method="NBDrop",cutoff=NULL, perc_genes = NULL){
+  
+  if((is.null(perc_genes)&is.null(cutoff))){
+    stop("Please provide exactly one of either cutoff or perc_genes")
+  }
+  
+  if(!(is.null(perc_genes)|is.null(cutoff))){
+    stop("Please provide either cutoff or perc_genes, not both!")
+  }
+  
+  library(M3Drop) #note that you require version > 2.0 (not on bioconductor yet)
+  
+  if(!method%in%c("NBDrop","NBDisp")){
+    stop("Invalid method selected. Please choose one of \"NBDrop\", \"NBDisp\"")
+  }
+  
+  # fitting the dropout model (DANB)
+  fit = NBumiFitModel(counts) #this fits a DANB model
+  fit$mus = t(sapply(fit$vals$tjs, function (x) x * fit$vals$tis/fit$vals$total))
+  
+  size_coeffs = NBumiFitDispVsMean(fit, suppress.plot = T)#get coefcients of mean-dispersion fit
+  smoothed_size = exp(size_coeffs[1] + size_coeffs[2] * log(fit$vals$tjs/fit$vals$nc)) #predicted dispersions per gene
+  size_mat = matrix(rep(smoothed_size, times = fit$vals$nc), ncol = fit$vals$nc, byrow = FALSE)
+  exp_ps  =  (1 + fit$mus/size_mat)^(-size_mat) #these are the fitted values per cell and gene
+  exp_tot = rowSums(exp_ps) #this is the total predicted molecules per gene
+  
+  plot_dt = data.table(Dropout_rate = fit$vals$djs/fit$vals$nc,
+                       expression = fit$vals$tjs/fit$vals$nc,
+                       sizes = fit$sizes,
+                       pred_sizes = smoothed_size,
+                       predicted_dropouts=exp_tot/fit$vals$nc)
+  
+  if(method=="NBDrop"){
+    NBumiCheckFitFS(counts,fit,suppress.plot = T) #check whether the fitted droout rates are well correlated with observed ones (i.e. number of zeroes)
+    pvals = NBumiFeatureSelectionCombinedDrop(fit) #ranks genes by difference from expected dropout rates
+    
+    if(is.null(cutoff)){ cutoff = sort(pvals)[as.integer(perc_genes/100*length(pvals))]}
+    
+    info = rownames(counts)%in%names(pvals[which(pvals<cutoff)]) #select the top features based on dropout rates
+    plot_dt[,info:=info]
+    
+    p = ggplot(plot_dt,aes(x=log10(expression),y=Dropout_rate)) +
+      geom_point(aes(color=info),alpha=0.7,size=2) + 
+      geom_line(aes(x=log10(expression),y=predicted_dropouts),color=colors()[30],size=1.2)+
+      theme_bw() + xlab("Expression [log10]") + ylab("Dropout Rate")+
+      ggtitle("Dropout rate vs. Expression")+ theme(text = element_text(size=17))+
+      scale_color_manual(values = colors()[c(226,32)],name="is_outlier")
+    print(p)
+    if(save_plot){
+      ggsave(p,file=file.path(plotdir,"NBdrop_plot.pdf"),height=6,width=8)
+    }
+  } else {
+    resids = NBumiFeatureSelectionHighVar(fit) #ranks genes by difference from fitted mean-dispersion power law
+    if(is.null(cutoff)){cutoff = perc_genes/100}
+    info = rownames(counts)%in%names(resids[which(resids<quantile(resids,cutoff))])
+    plot_dt[,info:=info]
+    plot_dt[,est_cv2:=(1+expression/sizes)/expression] #predicted variance according to DANB model
+    plot_dt[,ave_cv2:=(1+expression/pred_sizes)/expression] #predicted variance according to linear fit of dispersions
+    
+    p = ggplot(plot_dt,aes(x=log10(expression),y=log10(est_cv2))) +
+      geom_point(aes(color=info),alpha=0.7,size=2) + 
+      geom_line(aes(x=log10(expression),y=log10(ave_cv2)),color=colors()[30],size=1.2)+
+      theme_bw() + xlab("Expression [log10]") + ylab("Estimated CV^2 [log10]")+
+      ggtitle("Mean - Dispersion Relationship")+ theme(text = element_text(size=17))+
+      scale_color_manual(values = colors()[c(226,32)],name="is_outlier")
+    print(p)
+    if(save_plot){
+      ggsave(p,file=file.path(plotdir,"NBdisp_plot.pdf"),height=6,width=8)
+    }
+  }
+  return(info)
+}
+```
+
+
+#### Select genes based on GO annotation
+
+Input:
+
+* go_id: A GO identifier
+* organism: One of either "human" or "mouse"
+
+Output:
+
+* gene_ens: a list of ensembl gene identifiers mapping to this GO term.
+
+```{r}
+GO_to_gene = function(go_id, organism = "human"){
+  if(organism == "human"){
+    library(org.Hs.eg.db)
+    gene_eg = get(go_id,org.Hs.egGO2ALLEGS) # retrieve all entrez gene identifiers mapping to go_id
+    gene_ens = unlist(lapply(gene_eg, function(x) get(x,org.Hs.egENSEMBL))) #convert to ensembl
+  } else if(organism == "mouse"){
+    library(org.Mm.eg.db)
+    gene_eg = get(go_id,org.Mm.egGO2ALLEGS) # retrieve all entrez gene identifiers mapping to go_id
+    gene_ens = unlist(lapply(gene_eg, function(x) get(x,org.Mm.egENSEMBL))) #convert to ensembl
+  } else {stop("Organism has to be human or mouse.")}
+  return(gene_ens)
+}
+```
+
+### Clustering
+#### MCL (adapted from code provided by Marilisa Neri)
+Note: This method requires an external installation of MCL which can be obtained from [here](http://micans.org/mcl/). It consists of two steps: First, _build_adjacency_matrix_ calculates an adjacency matrix from some measure of similarity (currently, the only possibility is pearson correlation but I will probably change this in the future). Second, the adjacency matrix is converted to a graph and used as input for MCL. Note that MCL is extremely sensitive to the cutoffs that are chosenn to construct the adjacency matrix. As a rule of thumb, I look for the valley in the distribution of similarities and use this as a cutoff. If this does not work (i.e. MCL returns lot of tiny clusters), consider specifying the cutoff manually.
+
+Input:
+
+ * mat: a matrix of normalized expression values on a log2 scale or a matrix of similarities if is_similarity = TRUE
+ * cutoff: Either "auto" or a number between 0 and 1. Parameter for the correlation cutoff used to contruct the adjacency matrix. If set to "auto", the function will attempt to find a valley in the distribution of similarities and use this as a cutoff. If a number is provided, it will use this as a cutoff.
+ * adj: List. The output of _build_adjacency_matrix_, a list containing the adjacency matrix, the similarity matrix and the chosen cutoff.
+ 
+Output: 
+
+* groups.MCL: The cluster assignments. "0" means the cell was not assigned to any cluster.
+
+```{r}
+build_adjacency_matrix = function(mat,cutoff="auto", is_similarity = F){
+  library(Ckmeans.1d.dp)
+  if(!is_similarity){
+    message("Computing cell Pearson correlation coefficient")
+    corr.cells = cor(mat,method="pearson")
+  } else {corr.cells = mat}
+  
+  adj.corr = corr.cells
+  
+  if(cutoff=="auto"){
+    # we find the best correlation cutoff by looking for a "valley"
+    # in the histogram of correlations. This function attempts to set the
+    # cutoff automatically, but might not always succeed...
+    
+    # if there are more than 500 cells, randomly sample 500 correlations
+    if(dim(corr.cells)[1]>500){
+      idx = sample(seq(dim(corr.cells)[1]),size=500)
+    } else {idx = seq(dim(corr.cells)[1])}
+    
+    freqs = hist(corr.cells[idx,idx],breaks=dim(corr.cells[idx,idx])[1]/10)
+    k1d = Ckmeans.1d.dp(corr.cells,k=2)
+    cutoff = max(as.vector(corr.cells)[which(k1d$cluster==1)])
+    abline(v=cutoff,col="red")
+  } else if (is.numeric(cutoff)){cutoff=cutoff} else {
+    stop("Please provide a numeric value for corr.cutoff or set to \"auto\"")
+  }
+  
+  message("Building the adjacency matrix")
+  adj.corr[adj.corr<cutoff]=0
+  adj.corr[adj.corr>0] = 1
+  return(list(adj=adj.corr,cor=corr.cells,cutoff=cutoff))
+}
+
+MCLcell.clust=function(adj_list,selfloop=T,mcl_path = "/da/dmp/cb/prog/mcl-14-137/bin/mcl"){
+  library(igraph)
+  
+  adj = adj_list$adj
+  corr.cells = adj_list$cor
+  corr.cutoff = adj_list$cutoff
+  
+  if(!selfloop) diag(adj)=0 # no self-loop for MCL
+  message("Building Graph")
+  graphs = get.data.frame( graph.adjacency(adj), what = "edges") # gene connection for graphs
+  graphs = data.frame(graphs,CORR=sapply(seq(dim(graphs)[1]), function(i) corr.cells[graphs$from[i],graphs$to[i]] -corr.cutoff))
+  
+  write.table(graphs, file = "tmp.mcl.inp",row.names=F,col.names=F,sep = " ")
+  message("Running MCL")
+  system(paste0(mcl_path, " tmp.mcl.inp --abc -o tmp.mcl.out"))
+  x = scan("tmp.mcl.out", what="", sep="\n")
+  MCL.cells = strsplit(x, "[[:space:]]+")
+  MCL.cells = lapply(seq(length(MCL.cells)), function(i){
+    tmp = sapply(seq(length(MCL.cells[[i]])),function(j){
+      gsub('\"','',MCL.cells[[i]][j])
+    })
+  })
+  system("rm tmp.mcl.inp tmp.mcl.out")
+  
+  groups.MCL = matrix(rep(-1,dim(corr.cells)[2]),ncol=1)
+  rownames(groups.MCL) = colnames(corr.cells)
+  for(i in seq(length(MCL.cells))) groups.MCL[MCL.cells[[i]],]=i
+  
+  #if necessary, collapse all clusters containing only 1 cell to a big "unassigned"
+  groups.MCL[groups.MCL %in% names(table(groups.MCL)[which(table(groups.MCL)==1)])] = 0
+  
+  return(groups.MCL)
+}
+
+```
+
+#### DBSCAN
+DBSCAN is a density based algorithm that identifies clusters as regions of high density that are separated by regions of low density. Note that it is not suited for very high-dimensional data, therefore should be used only in combination with dimensionality reduction (usually PCA).
+
+Input:
+
+* dist: A dist object containing cell-cell distances in low-dimensional space.
+* min_pts: Integer. The number minimum points in the eps neighborhood. Generally, this should be one more than the dimensionality of the space in which distances were calculated, i.e. the number of used principal components +1. 
+* eps: "auto" or a number. The radius of the eps neighborhood (see dbscan documentation for details). As a rule of thumb, this should be the y value of the "elbow" on the KNNdistplot. If set to "auto", eps will be determined automatically.
+* tol: The tolerance when determining eps. The default is 0.01, which in general works quite well. The lower the tolerance, the smaller eps.
+  
+```{r}
+run_dbscan = function(dist,eps="auto",min_pts,tol=0.01){
+  library(dbscan)
+  #automatic determination of eps (the "elbow" in the kNNdistplot)
+  if(eps=="auto"){
+    kNNdist = sort(kNNdist(dist,min_pts))
+    i = seq(1,length(kNNdist),as.integer(0.001*length(kNNdist)))
+    slope_prev = 100
+    for(indx in i){
+      slope = kNNdist[indx]/indx
+      if(slope_prev>=slope-tol*slope){
+        slope_prev = slope
+      } else {
+        elbow = indx
+        break
+      }
+    }
+    eps = kNNdist[elbow]
+    print(paste("Epsilon: ",eps))
+  } else if(!is.numeric(eps)){
+    stop("Please provide a value for eps or set it to \"auto\"")} else {eps=eps}
+  
+  kNNdistplot(dist,k=min_pts)
+  abline(h=eps,col="red")
+  res = dbscan(dist,eps = eps,minPts = min_pts)
+  return(res$cluster)
+}
+```
+
+#### Mclust
+Mclust is a model-based clustering approach that uses an EM algorithm to fit a gaussian mixture model to the data. Mclust works under the assumption that the different cells come from a mixture of k multivariate normal distributions. In very high-dimensional space, this assumption often does not hold, therefore, mclust should only be used on coordinates in PCA space. 
+
+The actual clustering is performed by calling the function _gmm_main_ which has the following input parameters:
+
+* norm_exprs: A matrix of normalized expression values. If missing, you have to provide pre-computed PCA scores instead.
+* pc_scores: A matrix of PCA scores. Corresponds to prcomp$x.
+* n_comp: Integer. the number of PCA scores to use to calculate the model.
+* do_crossval: Logical. Should cross-validation be used to find the best number of clusters? If set to FALSE, you have to provide a value for best_k yourself.
+* tolerance: A number specifying how tolerant the algorithm should be when finding the best number of clusters. Larger numbers will result in fewer clusters.
+* k: Range of integers. The numbers of clusters to test during cross-validation. 
+* model_type: Specifies which parametrization to use. See the `mclustModelNames` help page for detail. The default, "VVI", corresponds to a diagonal model (i.e. all covariances are zero) with unequal variance and volume.
+* return_model: Return the mclust model object? If FALSE, only the cluster assignments are returned.
+
+```{r}
+gmm_main = function(norm_exprs=NULL,pc_scores=NULL,n_comp=10,do_crossval=T, model_type = "VVI",
+                     best_k=NULL,tolerance = 1.96,k=1:10,n_cores = 4, return_model = F){
+  library(mclust)
+  library(parallel)
+  
+  if(is.null(pc_scores)){
+    if(is.null(norm_exprs)){
+      stop("Missing expression values. Please provide either a matrix of normalized counts or pre-computed PCA scores.")
+    }
+    print("Running PCA...")
+    pca = pca_stuff(norm_exprs)
+    top_pc_scores = pca$x[,1:n_comp]
+  } else {
+    top_pc_scores = pc_scores[,1:n_comp]
+  }
+  
+  if(do_crossval){
+    #fit models with k-fold crossvalidation
+    folds = 1:10
+    n_folds = length(folds)
+    # this randomly determines which samples should be excluded from
+    # model fitting during each fold of the cross-validation. 
+    idx = 	sample(rep(1:n_folds, length.out = nrow(top_pc_scores))) 
+    
+    #Set up parallel processing
+    library(parallel)
+    cl = makeCluster(n_cores) 
+    funs = as.character(lsf.str(envir=parent.frame())) #let clusters know about functions in workspace
+    clusterExport(cl,funs)
+    
+    #benchmark
+    #time = system.time(parSapply(cl,folds,cross_val,data=testset,idx=idx,structure='VVI',components=k))
+    print("Determining number of clusters...")
+    likes = parSapply(cl,folds,cross_val,data=top_pc_scores,idx=idx,structure=model_type,components=k)
+    stopCluster(cl)
+    
+    mean_likes = apply(likes,1,function(x) sum(x[which(is.finite(x))])/length(which(x!=0 & is.finite(x))))
+    sd_likes = apply(likes,1,function(x) sd(x[which(x!=0 & is.finite(x))]))
+    sd_likes = sd_likes[which(!is.na(sd_likes))]
+    mean_likes = mean_likes[which(!is.na(sd_likes))]
+    best_idx = which(mean_likes==max(mean_likes))
+    ci_likes = mean_likes[best_idx]-tolerance*sd_likes[best_idx]
+    
+    best_k_idx = min(which(mean_likes>=ci_likes)) #smallest numebr of components that
+    #fit reasonably well
+    best_k = k[best_k_idx]
+    mean_likes[best_k_idx]
+    col=rep(1,n_folds)
+    col[best_k_idx] = 33
+    
+    # Plot likelihood vs number of clusters
+    # This should look like a ROC curve ideally. The best model should have
+    # a high likelihood with the smallest no. of clusters, i.e. be the one
+    # where the slope decreases. If there is no clear decrease in the
+    # slope, this means that pretty much any model fits equally well/bad and that
+    # most likely the clustering produces a nonsensical result
+    like_dt = data.table(cluster=k,color=as.factor(col),likes)
+    like_dt_melt = melt(like_dt,id.vars=c("cluster","color"),val="log-Likelihood",var="fold")
+    p = ggplot(like_dt_melt[`log-Likelihood`!=0 & is.finite(`log-Likelihood`)],aes(x=as.factor(cluster),y=`log-Likelihood`,fill=color)) +
+      geom_boxplot() + labs(x = "Number of clusters",
+                            title = paste0("No. clusters v.s. log-likelihood, ",n_folds,"-fold crossvalidation"),
+                            subtitle = paste0(n_comp," principal components used to calcualte model")) + 
+      theme_bw() +scale_fill_manual(values=c("white","red"),guide=F)
+    
+    #ggsave(p,file=file.path(plotdir,paste0("mclust_crossval_",n_comp,".pdf")),height=5,width=7)
+    print(p)
+    
+    print(paste0("Found ",best_k," clusters."))
+  } else {best_k = best_k}
+  
+  if(is.null(best_k)){
+    stop("Please provide a value for best_k or set do_crossval = TRUE")
+  }
+  print("Assigning cells to clusters...")
+  #assignments of cells to clusters
+  model = calc_model(top_pc_scores,best_k,model_type)
+  cluster_assignments = model$classification
+  if(return_model){
+    return(model)
+  } else {
+    return(cluster_assignments)}
+}
+
+```
+
+Additional functions called by _gmm_main_:
+
+```{r}
+#do pca
+pca_stuff = function(log_data_hv,scale_pca=T,center_pca=T){
+  pca = prcomp(t(log_data_hv[,-1,with=F]),scale=scale_pca,center=center_pca)
+  return(pca)
+}
+
+#Fitting GMM with mclust:
+##############################################################################
+# function to calculate different models
+# k = number of compnents
+# structure = model structure / constraints. See mclustModelNames for details.
+
+calc_model = function(data,k,structure){
+  return(Mclust(data,G=k,modelNames = structure,initialization=
+                  list(subset=sample(1:nrow(data),size=as.integer(nrow(data)*4/5)))))
+}
+
+#############################################################################
+#Functions to calculate log-likelihood out of what mclust returns
+
+# Probability density function for a Gaussian mixture
+# Presumes the mixture object has the structure used by mclust
+
+dnormalmix = function(x,mixture,log=FALSE) {
+  lambda 	= mixture$parameters$pro
+  k 		= length(lambda)
+  # Calculate share of likelihood for all data for one component
+  like_component = function(x, component) {
+    lambda[component] * dmvnorm(
+      x,
+      mean = mixture$parameters$mean[,component],
+      sigma 	= mixture$parameters$variance$sigma[,,component]
+    )
+  }
+  # Create array with likelihood shares from all components over all data
+  likes 	= sapply(1:k, like_component ,x = x)
+  # Add up contributions from components
+  d 	= rowSums(likes)
+  if (log) {
+    d 	= log(d)
+  }
+  return(d)
+}
+
+# Log likelihood function for a Gaussian mixture, potentially on new data
+loglike_normalmix = function(x,mixture) {
+  loglike 	= dnormalmix(x, mixture, log = TRUE)
+  return(sum(loglike))
+}
+
+###############################################################################
+#Cross validation things
+#Cross validation
+#data = input data
+#idx = a random sample of folds (e.g. 11432...)
+#fold = the current fold
+#structure = model structure for mclust (e.g. 'VVI)
+#components = a vector containing the numebr of components for which to test models
+
+cross_val = function(fold,data,idx,structure,components){
+  #library(mclust,lib.loc = .libPaths()[[2]]) #for the VM
+  library(mclust)
+  library(mvtnorm)
+  like_test = c()
+  for(k in components){
+    out = tryCatch(
+      {
+        calc_model(data[which(idx!=fold),],k,structure)
+      },
+      error=function(cond){
+        #try to find another model
+        out2 = 0
+        counter = 0
+        while(out2 == 0 && counter<=5){
+          out2 = tryCatch(
+            {
+              calc_model(data[which(idx!=fold),],k,structure)
+            },
+            error = return(0),
+            warning=return(0),
+            finally= {counter = counter +1}
+          )
+        }
+        message('There was an error: \n')
+        message(cond)
+        write.csv(cond,'gmm.log',append=TRUE)
+        return(out2)
+      },
+      warning=function(cond){
+        #try to find another model
+        out2 = 0
+        counter = 0
+        while(out2 == 0 && counter<=10){
+          out2 = tryCatch(
+            {
+              calc_model(data[which(idx!=fold),],k,structure)
+            },
+            error = return(0),
+            warning=return(0),
+            finally={counter = counter +1}
+          )
+        }
+        message('There was a warning: \n')
+        message(cond)
+        write.csv(cond,'gmm.log',append=TRUE)
+        return(out2)
+      },
+      finally={
+        message('\n done.')
+      }
+    )
+    if(class(out)=='Mclust'){  
+      like_test = append(like_test,loglike_normalmix(data[which(idx==fold),],out))
+    }
+    else{
+      like_test = append(like_test,0)
+    }
+  }
+  return(like_test)
+}
+```
+
+#### Seurat
+This implements the clustering method provided in Seurat. See the [package documentation](http://satijalab.org/seurat/) for details.
+
+Input:
+
+* sce: SCESet containing raw and normalized data.
+* vars.to.regress: Character vector (optional). Names of columns in pData(sce) that are possible confounders and whose contribution to the variation should be regressed out.
+* res: resolution of the clustering. The higher, the more small clusters will be made.
+* n_comp: Integer. number of principal compenents to use in clustering.
+
+```{r}
+seurat_clustering = function(sce,vars.to.regress=NULL,res=0.6,n_comp=10){
+  
+  library(Seurat)
+  #make SEURAT object, scale and optionally regress out confounders
+  tmp_seurat = CreateSeuratObject(raw.data = counts(sce))
+  tmp_seurat@data = norm_exprs(sce) #add the normalized values
+  
+  # This next step is a bit of cheating. Seurat expects us to run the complete
+  # workflow on the same object and checks whether data have been normalized
+  # by checking if object@calc.params$NormalizeData$normalization.method exists.
+  # Since we provided normalized values, and do not want to re-run normalization,
+  # we just put a dummy value in that slot.
+  
+  tmp_seurat@calc.params$NormalizeData = list(normalization.method ="dummy")
+  
+  if(!is.null(vars.to.regress)){
+    if(any(!vars.to.regress%in%names(pData(sce)))){
+      stop("Variables to regress out have to be column names in pData(sce)")
+    }
+    tmp_seurat = AddMetadata(object = tmp_seurat, metadata = pData(sce)[,vars.to.regress])
+    tmp_seurat = ScaleData(object = tmp_seurat,vars.to.regress=vars.to.regress)
+  } else {
+    tmp_seurat = ScaleData(object = tmp_seurat)
+  }
+  
+  tmp_seurat = RunPCA(object = tmp_seurat, pc.genes = rownames(sce), do.print = FALSE) 
+  tmp_seurat = FindClusters(object = tmp_seurat, reduction.type = "pca", dims.use = 1:n_comp, 
+                       resolution = res, print.output = 0, save.SNN = TRUE)
+  seurat_assignment = tmp_seurat@ident
+  return(seurat_assignment)
+}
+
+```
+
+### Rare cell types
+
+This function identifies cell subclusters that are characterized by specific expression of correlated gene sets. The whole algorithm consists of 5 steps:
+
+1. Identify genes with a bimodal distribution of expression levels
+2. Test whether these genes are specific to one main cluster
+3. Group candidate genes into correlated gene sets using MCL
+4. Assign cells to subgroups based on mean expression of those gene sets
+5. (optional) Annotate genes and print summary
+
+The main function `rare_cell_type_identifier` takes the following arguments:
+
+* sce: SCESet. Your dataset.
+* group_id: Character. A column name in pData(sce) that specifies how the cells should be grouped in clusters.
+* min_n_cells: Integer. When identifying bimodal gene distributions, this specifies the minimum number of cells per mode. Also, clusters with a total number of cells below 2x this number will be entirely ignored.
+* min_fc: Numeric, defaults to 2. Minimum difference in mean [log2] between the two modes of the gene expression distribution. 
+* fc_between_cutoff: Numeric, defaults to 1. Minimum difference [log2] in gene expression between cells in the subcluster and all other cells. The higher, the more cluster-specific the genes. Note that this should not be set higher than min_fc.
+* verbose: Logical. Should a summary of the results be printed?
+* organism: One of either "human" or "mouse". Only relevant if verbose=TRUE. Specifies which genome anotation to use when printing the results summary.
+* corr_cutoff: Correlation cutoff for MCL clustering of candidate marker genes. If NULL, it will be set automatically for each cluster, which in general works much better than forcing a fixed value. Therefore, leave this at the default unless you have a good reason to change it.
+* iter: 0 or 1. Relevant for the final step (assigning cells to subgroups). If set to 1, the first mode of gene expression will be discarded. Cells are then assigned based on the 2nd and 3rd mode, which results in a more stringent assignment. The default is 0 and is usually stringent enough.
+* max_perc_cells: Maximum percentage of cells that can be part of a subcluster. Defaults to 50, implying that a "subgroup" cannot contain more than half of the total observations. 
+
+The output is a `data.table`. Refer to the main text for how to query it.
+
+```{r}
+rare_cell_type_identifier = function(sce,group_id,min_n_cells=10,verbose = T, min_fc = 2,
+                                     organism = "human", corr_cutoff = NULL, iter=0, max_perc_cells = 50,
+                                     fc_between_cutoff = 1){
+  library(Ckmeans.1d.dp)
+  
+  expr_dt = data.table(gene_id = rownames(sce),norm_exprs(sce))
+  expr_dt_melt = melt(expr_dt,id.vars="gene_id",val="expr",var="cell_idx")
+  expr_dt_melt = merge(expr_dt_melt,
+                       data.table(cell_idx=colnames(sce),main_cluster=as.character(pData(sce)[,group_id])),
+                       by="cell_idx")
+  
+  #Identify genes with significant bimodal distribution
+  
+  expr_dt_melt[,c("N_cells","within_p","pos0","pos1","Dpos"):=find_bimodal_genes(expr,min_n_cells = min_n_cells, max_perc_cells = max_perc_cells),by=c('gene_id','main_cluster')]
+  expr_dt_melt[,sig := within_p<100 & Dpos > min_fc] 
+  expr_dt_melt[sig==T, within_adj_p:=p.adjust(within_p),by=c('cell_idx')] #correct for multiple testing, only consider genes where test has actually been run
+  expr_dt_melt[,sig:=within_adj_p<0.1] 
+  expr_dt_melt = expr_dt_melt[gene_id %in% expr_dt_melt[!is.na(sig) & sig==T]$gene_id] 
+  
+  # If no bimodal gene were found, exit and return NA
+  if(dim(expr_dt_melt)[1] == 0){
+    print("No genes with bimodal distribution found, returning NA.")
+    return(NA)
+  }
+  # Check whether these genes are specific to the subcluster
+  
+  for(clust in unique(expr_dt_melt$main_cluster)){
+    expr_dt_melt = expr_dt_melt[,paste0(clust,"_",c("p_between","fc")):=test_cluster_specificity(
+      expr,main_cluster,clust, fc_between_cutoff = fc_between_cutoff),by="gene_id"]
+    
+    expr_dt_melt[main_cluster==clust,keep:=(expr_dt_melt[main_cluster==clust][[paste0(clust,"_p_between")]] < 0.1)]
+  }
+  
+  expr_dt_melt = expr_dt_melt[keep==TRUE & !is.na(sig)]
+  
+  # If there are still non-specific genes, discard them (this can happen for
+  # very high expressed genes like mitochondrial genes)
+  expr_dt_melt[,n_clust_per_gene:=length(unique(main_cluster)),by='gene_id']
+  expr_dt_melt = expr_dt_melt[n_clust_per_gene==1]
+  expr_dt_melt[,n_clust_per_gene:=NULL]
+  
+  # Identify correlated gene sets with MCL
+  expr_dt_melt = expr_dt_melt[,gene_cluster:=0]
+  expr_dt_melt = find_gene_sets(expr_dt_melt, corr_cutoff = corr_cutoff)
+  
+  # discard gene sets that only contain one gene (those are assigned to cluster 0)
+  expr_dt_melt = expr_dt_melt[gene_cluster !=0 ]
+  
+  if(dim(expr_dt_melt)[1] == 0){
+    print("No subclusters found, returning NA.")
+    return(NA)
+  }
+  
+  # Extract cell subclusters
+  expr_dt_melt[,sub_cluster:=main_cluster]
+  expr_dt_melt[,mean_expr := mean(expr), by = c('main_cluster','gene_cluster','cell_idx')]
+  expr_dt_melt[,sub_cluster:=sub_cluster(mean_expr,sub_cluster,gene_cluster, iter=iter),by=c('main_cluster','gene_cluster')]
+  
+  # Check how many cells belong to the subgroup relative to the total cluster size.
+  # If a sub cluster contains more than max_perc_cells cells, discard it.
+  clust_list = expr_dt_melt[,list(sub = length(unique(cell_idx))) ,by=c('sub_cluster','main_cluster')]
+  clust_list[,tot := sum(sub)/(length(sub_cluster)/2), by= 'main_cluster']
+  clust_list = clust_list[grep('_1$',sub_cluster)]
+  clust_list[,perc:=sub/tot*100]
+  discard_sub_clust = clust_list[perc > max_perc_cells]$sub_cluster
+  discard_sub_clust = append(discard_sub_clust,gsub('_1$','_0',discard_sub_clust))
+  
+  expr_dt_melt = expr_dt_melt[!sub_cluster%in%discard_sub_clust]
+  
+  # If verbose is TRUE, print a summary of the results
+  if(verbose){
+    # annotate genes (only if verbose)
+    gene_info = get_gene_annotations(unique(expr_dt_melt$gene_id),get_descriptions = T,
+                                     organism = organism)
+    expr_dt_melt = merge(expr_dt_melt,gene_info, by = 'gene_id')
+    
+    print_summary(expr_dt_melt)
+  }
+  return(expr_dt_melt)
+}
+
+##################################################
+# STEP 1: Identify genes with bimodal distribution
+##################################################
+
+find_bimodal_genes = function(expr, min_n_cells, max_perc_cells){
+  
+  #skip genes with 0 expression
+  if(sum(expr)==0){
+    return(list(-1,100,-1,-1,-1))
+  }
+  # run k-means
+  k1d = Ckmeans.1d.dp(expr,k=2)
+  # check if a cluster with more than n cells exists
+  indx = which(k1d$size>min_n_cells) 
+  if(length(indx)>1 ){
+    
+    # do statistic only if in pos2 cells are less than max_perc_cells% of the total cells in the cluster
+    if(k1d$size[2] < round(length(expr)*max_perc_cells/100)){ 
+      
+      t1=tryCatch({t.test(expr[which(k1d$cluster==2)],y=expr[which(k1d$cluster==1)])},
+                   error = function(cond){return(0)},
+                   finally={}
+      )
+      
+      if(!is.numeric(t1)){
+        
+        p1=t1$p.value
+        N0=k1d$size[1] # number of cells where the gene is downregulated
+        N1=k1d$size[2] # number of cells  where the gene is upregulated
+        pos0=k1d$centers[1] 
+        pos1=k1d$centers[2]
+        Dpos=pos1-pos0
+        return(list(N1,p1,pos0,pos1,Dpos))
+      } #else {print(paste("ttest failed, dpos = ",pos1-pos0))} # for testing
+    }
+  }
+  # if no cluster was found, return a list of dummy values
+  return(list(-1,100,-1,-1,-1))
+}
+
+##################################################
+# STEP 2: Check whether these genes are specific to one cell subgroup
+###################################################
+
+test_cluster_specificity = function(exprs, cluster, current_cluster, fc_between_cutoff){
+  
+  in_clust = which(cluster == current_cluster)
+  k1d = Ckmeans.1d.dp(exprs[in_clust],k=2)
+  in_subclust = in_clust[which(k1d$cluster==2)]
+  
+  mean_in = mean(exprs[in_subclust])
+  mean_out = mean(exprs[-in_subclust])
+  mean_out_nozero = mean(exprs[-in_subclust][exprs[-in_subclust]>0])
+  
+  # If there are subclusters, but all cells outside the subcluster express 0,
+  # set mean_out_nozero to 0
+  if(length(in_subclust>0) && !any(exprs[-in_subclust]>0)){mean_out_nozero=0}
+  
+  fc = mean_in - mean_out
+  
+  ts = tryCatch({t.test(exprs[in_subclust],exprs[-in_clust])},
+                error = function(cond){ return(0)})
+  
+  if(!is.numeric(ts)){pv = ts$p.value} else {
+    #print(paste("ttest failed, fc = ",mean_in-mean_out_nozero)) #for testing only
+    pv=999}
+  
+  if(!is.nan(mean_out_nozero) && (mean_in-mean_out_nozero < fc_between_cutoff)) pv = 999
+  return(list(pv,fc))
+}
+
+#####################################################
+# STEP 3: MCL clustering to find correlated gene sets
+#####################################################
+
+find_gene_sets = function(expr_dt_melt, corr_cutoff = NULL, min_corr = 0.35, max_corr = 0.5,
+                          mcl_path = "/da/dmp/cb/prog/mcl-14-137/bin/mcl"){
+  library(igraph)
+  
+  for(clust in unique(expr_dt_melt$main_cluster)){
+    
+    if(length(unique(expr_dt_melt[main_cluster == clust]$gene_id))==1) { next }
+    
+    mat = dcast.data.table(expr_dt_melt[main_cluster==clust], gene_id ~ cell_idx,
+                           value.var = 'expr')
+    mat = mat[rowSums(mat[,-1,with=F])!=0,]
+    corr.mat = cor(t(mat[,-1,with=F]))
+    dimnames(corr.mat) = list(mat$gene_id,mat$gene_id)
+    
+    if(is.null(corr_cutoff)){
+      corr_cutoff = max(quantile(corr.mat[corr.mat!=1],0.95),min_corr)
+      corr_cutoff = min(corr_cutoff, max_corr)}
+    adj.corr = corr.mat
+    adj.corr[adj.corr<corr_cutoff] = 0
+    adj.corr[adj.corr>=corr_cutoff] = 1
+    diag(adj.corr) = 0 # no self-loop for MCL
+    
+    graphs = get.data.frame( graph_from_adjacency_matrix(adj.corr), what = "edges") # gene connection for graphs
+    
+    # if a graph has no edges (i.e. all genes are uncorrelated), 
+    # assign all genes to cluster "0" and go to next iteration
+    if(dim(graphs)[1]==0){
+      expr_dt_melt = expr_dt_melt[main_cluster == clust, gene_cluster := 0]
+      next
+    }
+    
+    graphs = data.frame(graphs,CORR=sapply(seq(dim(graphs)[1]), function(i) corr.mat[graphs$from[i],graphs$to[i]] -corr_cutoff))
+    write.table(graphs, file = "tmp.mcl.inp",row.names=F,col.names=F,sep = " ")
+    system(paste0(mcl_path, " tmp.mcl.inp --abc -o tmp.mcl.out"))
+    x = scan("tmp.mcl.out", what="", sep="\n")
+    y = strsplit(x, "[[:space:]]+")
+    y = lapply(seq(length(y)), function(i){
+      tmp = sapply(seq(length(y[[i]])),function(j){
+        gsub('\"','',y[[i]][j])
+      })
+    })
+    
+    for(i in seq(length(y))){
+      if(length(y[[i]] > 1)){
+        expr_dt_melt = expr_dt_melt[main_cluster==clust & gene_id %in% y[[i]],gene_cluster:=i]
+      }
+    }
+  }
+  
+  return(expr_dt_melt)
+}  
+
+############################################
+# Step 4: Assign cells to subgroups
+############################################
+
+sub_cluster = function(mean_expr,sub_cluster,gene_cluster, iter = 0){
+  
+  k1d = Ckmeans.1d.dp(mean_expr,k=2)$cluster
+  cells_sub = (k1d==2)
+  
+  if(iter == 0){return(paste0(sub_cluster,"_",gene_cluster,"_",as.numeric(cells_sub)))}
+  
+  # if iter is set higher than 0, a second step of kmeans clustering. 
+  # This will remove the lowest peak and can sometimes help to get a more
+  # accurate classification.
+  
+  k1d = Ckmeans.1d.dp(mean_expr[cells_sub],k=2)$cluster
+  
+  if (max(k1d)>1) {
+    cells_sub[cells_sub] = (k1d==2)
+    return(paste0(sub_cluster,"_",gene_cluster,"_",as.numeric(cells_sub)))
+  }
+  return(paste0(sub_cluster,"_",gene_cluster,"_",0))
+}
+
+#######################################
+# Step 5: Print summary
+#######################################
+
+print_summary = function(expr_dt_melt){
+  cat('--------------------------------------------------------\n',
+      'Summary of rare cell types\n',
+      '--------------------------------------------------------\n\n')
+  for(clust in unique(expr_dt_melt$main_cluster)){
+    
+    if(!any(expr_dt_melt[main_cluster==clust]$gene_cluster!=0)){
+      next
+    }
+    cat('Main cluster: ', clust,  '\n', '---------------\n')
+    subclusts = unique(expr_dt_melt[main_cluster==clust & gene_cluster!=0][order(gene_cluster)]$gene_cluster)
+    for(subclust in subclusts){
+      
+      cat('Subcluster: ', subclust, '\n',
+          'Number of cells: ', 
+          length(unique(expr_dt_melt[main_cluster==clust & 
+                                       sub_cluster == paste(clust,subclust,1,sep="_")]$cell_idx)),
+          '\n Marker genes: \n')
+      
+      print(unique(expr_dt_melt[main_cluster==clust & gene_cluster == subclust][,c("gene_id","symbol","description")]))
+      cat('\n\n')
+      
+    }
+  }
+}
+
+# Visualize output of rare cell type algorithm on tSNE map
+# tsne = RTsne object 
+# rare = output of the rare cell types algorithm (a data.table)
+plot_rare_cells = function(tsne,rare){
+  
+  tsne_dt = data.table(tSNE1 = tsne$Y[,1], tSNE2 = tsne$Y[,2], cell_idx = rownames(tsne$Y))
+  tsne_dt = merge(tsne_dt, rare[,c('cell_idx','main_cluster','sub_cluster')],
+                  by = c('cell_idx'), all = T)
+  tsne_dt[is.na(main_cluster),main_cluster:='Other']
+  tsne_dt[main_cluster == 'Other',sub_cluster:='none']
+  tsne_dt[grepl('_0$',sub_cluster),sub_cluster:= 'none']
+  
+  setkey(tsne_dt, 'cell_idx')
+  tsne_dt = unique(tsne_dt)
+  
+  rc_cols = brewer.pal(10,"Spectral")[rep(c(1,9,7,2,6,10,3,8),3)]
+  
+  p = ggplot(tsne_dt, aes(x = tSNE1, y= tSNE2)) + 
+    geom_point(color = "darkgray", alpha = 0.5, size = 1.5)+
+    theme_bw() + theme(text = element_text(size = 15))
+  p = p + geom_point(data = tsne_dt[sub_cluster!='none'], aes(x=tSNE1, y=tSNE2, color = sub_cluster))+
+    scale_color_manual(values = rc_cols) + guides(color = guide_legend(title = 'Subcluster'))
+  return(p)                                                                     
+}
+
+```
+
+Function to plot result of rare cell algorithm on tSNE map:
+
+* tsne: Rtsne object. A pre-computed tSNE map.
+* rare: data.table. The output of the rare cell type algorithm.
+
+```{r}
+# Visualize output of rare cell type algorithm on tSNE map
+# tsne = RTsne object 
+# rare = output of the rare cell types algorithm (a data.table)
+plot_rare_cells = function(tsne,rare){
+  
+  tsne_dt = data.table(tSNE1 = tsne$Y[,1], tSNE2 = tsne$Y[,2], cell_idx = rownames(tsne$Y))
+  tsne_dt = merge(tsne_dt, rare[,c('cell_idx','main_cluster','sub_cluster')],
+                  by = c('cell_idx'), all = T)
+  tsne_dt[is.na(main_cluster),main_cluster:='Other']
+  tsne_dt[main_cluster == 'Other',sub_cluster:='none']
+  tsne_dt[grepl('_0$',sub_cluster),sub_cluster:= 'none']
+  
+  setkey(tsne_dt, 'cell_idx')
+  tsne_dt = unique(tsne_dt)
+  
+  rc_cols = brewer.pal(10,"Spectral")[rep(c(1,9,7,2,6,10,3,8),3)]
+  
+  p = ggplot(tsne_dt, aes(x = tSNE1, y= tSNE2)) + 
+    geom_point(color = "darkgray", alpha = 0.5, size = 1.5)+
+    theme_bw() + theme(text = element_text(size = 15))
+  p = p + geom_point(data = tsne_dt[sub_cluster!='none'], aes(x=tSNE1, y=tSNE2, color = sub_cluster))+
+    scale_color_manual(values = rc_cols) + guides(color = guide_legend(title = 'Subcluster'))
+  return(p)                                                                     
+}
+```
+
+### Differential Expression Analysis
+The functions in the following are wrappers to the respective packages. for details what each of them does, please refer to the package documenatations.
+
+General input for all of them:
+
+* sce = the SCESet after QC or after normalization
+* cl_id : the name of the grouping (e.g. "mclust") used in the comparison. Must be
+  a column name of pData(sce)
+* cl_ref: the entry in pData(sce)$cl_id that should be used as the reference,
+ i.e. against which all the rest of the cells are compared
+ * alpha = false discovery rate cutoff, default = 0.05
+* fc_cutoff = log2 fold change cutoff, default = 0.5
+
+#### Wilcoxon test
+This function runs the Wilcoxon test to calculate p-values, adjusts them for multiple correction using Benjamini-Hochberg method, and calculates fold changes. There is one additional parameter:
+
+* pseudocount: Deprecated and will be removed!
+
+```{r}
+run_wilcoxon_test = function(sce,cl_id,cl_ref,
+                             alpha=0.05,fc_cutoff=0.5,pseudocount=NULL){
+  
+  if(!is.null(pseudocount)){warning("The pseudocount argument is deprecated and will be removed!")}
+  
+  ignore = is.na(pData(sce)[,cl_id])
+  sce = sce[,!ignore] 
+  
+  in_clust = pData(sce)[,cl_id] %in% cl_ref
+  pvals = apply(norm_exprs(sce),1,
+                function(x) wilcox.test(x=x[in_clust],y=x[!in_clust])$p.value)
+  fc = apply(norm_exprs(sce),1,
+             function(x) mean(x[in_clust])-mean(x[!in_clust]))
+  #log2((mean(2^x[in_clust]-1)+pseudocount)/(mean(2^x[!in_clust]-1)+pseudocount))
+  
+  out = data.table(gene_id = rownames(sce), pval = pvals, log2fc = fc)
+  out[,adj_pval:=p.adjust(pval,method="fdr")]
+  out[,DE_flag:=(adj_pval<alpha & abs(log2fc)>fc_cutoff)]
+  
+  return(out)
+}
+```
+
+#### limma
+This function implements the limma-voom and limma-trend methods. It takes three additional parameters:
+
+  * count_thr, pct: Filter criteria. Genes that do not have a minimum count of `count_thr` in `pct`% of cells in at least one cluster are excluded. This is required because limma can become unreliable in the presence of too many very low expressed genes.
+  * method: one of "voom" or "trend". Specifies which limma method to use. The default is "trend" since this seems to work better with zero-inflated data.
+  
+```{r}
+run_limma = function(sce,cl_id,cl_ref,
+                    alpha=0.05,fc_cutoff=0.5,count_thr=1,pct=50, method = "trend"){
+  
+  if(!method %in% c("voom","trend")){
+    stop("Method has to be either \"voom\" or \"trend\".")
+  }
+  
+  ignore = is.na(pData(sce)[,cl_id])
+  sce = sce[,!ignore] 
+  
+  res = as.factor(pData(sce)[,cl_id] %in% cl_ref)
+  design = model.matrix(~0+res)
+  colnames(design) = c("Rest","Cluster")
+  rownames(design) = colnames(sce)
+  
+  # filter out genes not detected at a count of count-thr in at least
+  # 50% of cells in at least one cluster. Outlier cells (clusters with only one cell) are ignored.
+  clust_sizes = table(pData(sce)[,cl_id])
+  clusts = names(clust_sizes[which(clust_sizes>1)])
+  
+  keep_mat = matrix(rep(NA,dim(sce)[1]*length(clusts)),ncol = length(clusts))
+  for(i in seq(length(clusts))){
+    keep_mat[,i] = rowSums(counts(sce)[,pData(sce)[,cl_id]==clusts[i]]>=count_thr)>=pct/100*length(which(pData(sce)[,cl_id]==clusts[i]))  
+  }
+  keep = apply(keep_mat, 1, function(x) any(x))
+  
+  #convert to DGEList and filter
+  dge = convertTo(sce[keep,],"edgeR")
+  contrast_matrix = limma::makeContrasts(Cluster-Rest, levels = design)
+  
+  if(method == "voom"){
+    # transforming counts
+    voomt = limma::voom(dge,plot=T,design = design)
+    
+    #do differential expression analysis on voom transformed data
+    fit = limma::lmFit(voomt, design)
+    fit2 = limma::contrasts.fit(fit,contrast_matrix)
+    fit2 = limma::eBayes(fit2)
+  } else {
+    logCPM = edgeR::cpm(dge, log=TRUE, prior.count=1)
+    fit = limma::lmFit(logCPM, design)
+    fit2 = limma::contrasts.fit(fit,contrast_matrix)
+    fit2 = limma::eBayes(fit2, trend = T)
+  }
+  
+  diff_exp = limma::topTable(fit2,adjust="BH",number = dim(dge)[1])
+  out = data.table(gene_id = rownames(diff_exp),diff_exp)
+  out[,DE_flag:=as.factor(adj.P.Val < alpha & abs(logFC) > fc_cutoff)]
+  
+  return(out)
+}
+```
+
+
+#### MAST
+This function has several additional parameters:
+
+* n_cores: Number of cores to be used.
+* n_bins: Number of bins used to estimate expression threshold. 
+* min_per_bin: Minimum number of genes per bin.
+* norm: Logical. Use the normalized expression values?
+* set_thresh: Logical. Should expression thresholds be determined? If you cannot see clear bimodal distributions on the MAST_thresholds plot, set this to false.
+
+```{r}
+run_MAST = function(sce,cl_id,cl_ref,n_cores = 8,nbins=10,min_per_bin=30,
+                    alpha=0.05,fc_cutoff=0.5,norm=F,set_thresh=T){
+  
+  library(MAST)
+  
+  ignore = is.na(pData(sce)[,cl_id])
+  sce = sce[,!ignore] 
+  
+  options(mc.cores = n_cores)
+  if(norm){
+    sca = FromMatrix(norm_exprs(sce), pData(sce), fData(sce))} else {
+      sca = FromMatrix(log2(counts(sce)+1), pData(sce), fData(sce))
+    }
+  # adaptive thresholding
+  # note how the threshold moves with median expression
+  if(set_thresh){
+    message("Calculating expression thresholds...\n
+            Check the MAST_theresholds plot. If there are no clear bimodal\n
+            distributions, the thresholds are likely to be nonsense.\n
+            If that is the case, re-run this function setting set_thresh = F")
+    thres = thresholdSCRNACountMatrix(assay(sca), nbins = nbins, min_per_bin = min_per_bin)
+    if(!any(thres$cutpoint!=0)){message("All cut points are zero. Try using a different
+                                        value of nbins and min_per_bin or set set_thresh=FALSE")}
+    par(mfrow=c(nbins%%4+1,4))
+    plot(thres)
+    dev.copy2pdf(file = file.path(plotdir,"MAST_thresholds.pdf"),width=8,height=3*(nbins%%4+1))
+    par(mfrow=c(1,1))
+    assays(sca) = list(thresh=thres$counts_threshold, counts=assay(sca))
+    }
+  
+  cond=factor(colData(sca)[,cl_id]==cl_ref)
+  cond=relevel(cond,"FALSE")
+  colData(sca)$condition=cond
+  # calculate the cellular detection rate as no. detected features / no. total features
+  # and center it 
+  colData(sca)$cngeneson = scale(pData(sce)$total_features/dim(sce)[1],scale=F)
+  # fit model (note that this will take time for large datasets!!)
+  message("Fitting models...")
+  zlmCond = zlm(~condition + cngeneson, sca)
+  summaryCond = summary(zlmCond, doLRT='conditionTRUE') 
+  #extract the results as a data.table
+  summaryDt = summaryCond$datatable
+  fcHurdle = merge(summaryDt[contrast=='conditionTRUE' & component=='H',.(primerid, `Pr(>Chisq)`)], #hurdle P values
+                    summaryDt[contrast=='conditionTRUE' & component=='logFC', .(primerid, coef, ci.hi, ci.lo)], by='primerid') #logFC coefficients
+  fcHurdle[,fdr:=p.adjust(`Pr(>Chisq)`, 'fdr')]
+  names(fcHurdle)[1:3] = c("gene_id","pval","log2FC")
+  fcHurdle[,DE_flag:=as.factor(fdr<alpha & abs(log2FC)>fc_cutoff)]
+  return(fcHurdle)
+}
+
+```
+
+### Miscellaneous Plotting
+
+#### Generic scatterplot using ggplot2 and data.table
+
+This function takes a data.table as input and plots two columns, x_col and y_col, against each other. Optional arguments can be provided to control color, size and shape of the plotted symbols. 
+
+Input:
+
+* dt:  data.table with all the data to be plotted
+* x_col: name of the column to lot on x axis
+* y_col: name of column to plot on y axis
+* color: name of column to use as color values. If numeric, a continuous color scheme will be applied, if character or factor, colors will be discrete.
+* shape: name of column to use for shape
+* size: name of column to use for size
+* alpha: transparency
+* abs_size; If no values for size are provided, abs_size sets the absolute size of the points on the plot.
+
+Output:
+
+* p: The plot as a ggplot object
+
+```{r}
+generic_scatterplot = function(dt, x_col, y_col, 
+                        color = NULL, shape = NULL, size = NULL, alpha = 0.8, abs_size = 2){
+  
+  plot_dt = dt[,c(x_col,y_col),with=F]
+  
+  #by default, do not show any legends
+  show_col = F
+  show_shape = F
+  show_size = F
+  continuous = F
+  discrete = F
+  
+  if(!is.null(color)){
+    plot_dt[,c(color):=dt[[color]]]
+    if(!is.numeric(dt[[color]])){
+      show_col = guide_legend(color)
+      discrete = T
+    } else{
+      show_col = guide_colorbar(color)
+      continuous = T
+    }
+  } else {
+    color = "dummy_color"
+    plot_dt[,dummy_color:=factor(1)]
+  }
+
+  if(!is.null(shape)){
+    show_shape = guide_legend(shape)
+    plot_dt[,c(shape):=dt[[shape]]]
+  } else {
+    shape = "dummy_shape"
+    plot_dt[,dummy_shape:=factor(1)]
+  }
+  
+  if(!is.null(size)){
+    show_size = guide_legend(size)
+    plot_dt[,c(size):=dt[[size]]]
+  } else {
+    size ="dummy_size"
+    plot_dt[,dummy_size:= 1]
+  }
+  
+  p = ggplot(na.omit(plot_dt), aes_string(x=paste0("`",x_col,"`"),y=paste0("`",y_col,"`")))
+  if(size == "dummy_size"){
+    p = p+geom_point(aes_string(color=paste0("`",color,"`"),
+                                shape=paste0("`",shape,"`"),
+                                size=paste0("`",size,"`")),
+                     alpha=alpha,size=abs_size)
+  } else{
+    p = p+ geom_point(aes_string(color=paste0("`",color,"`"),
+                                 shape=paste0("`",shape,"`"),
+                                 size=paste0("`",size,"`")),
+                      alpha=alpha)}
+  
+  p = p + guides(color = show_col, shape = show_shape, size = show_size)+
+    theme_bw()+theme(text=element_text(size=15))
+  
+  if(continuous){
+    p = p+scale_color_continuous(low = "lightgray", high = "darkblue")
+  }
+    
+  if(discrete){
+    if(length(unique(na.omit(plot_dt[[color]])))==2){
+      p = p+scale_color_manual(values = c("lightgray","darkred"))
+    } else{p = p + scale_color_brewer(type = "qual",palette = 2)}
+  }
+    
+  if(color == "dummy_color"){
+    p = p + scale_color_manual(values = "darkgrey")
+  }
+  
+  if(shape!="dummy_shape"){
+    if(length(unique(na.omit(plot_dt[[shape]])))>9) {stop("Too many different shapes provided. Please provide a maximum of 9 shapes, otherwise, your plot will be a mess.")}
+     p = p + scale_shape_manual(values = c(15,16,17,18,8,0,1,2,3))
+  }
+  
+  return(p)
+} 
+```
+
+#### PCA plot
+Calculates a PCA and makes a plot.
+
+Input:
+
+* counts: A matrix of log2 transformed, raw or normalized counts. If no counts are provided, a pre-computed prcomp object has to be provided instead.
+* pca: prcomp object. A result from a previous PCA calculation. If missing, a new PCA is calculated.
+* scale_pca: Logical. Should the data be scaled to have unit variance? Default = TRUE.
+* center_pca: Logical. Should the data be centered before calculating PCA? Default = TRUE.
+* comp: Numerical vector with 2 elements. The 2 components to plot against each other.
+* return_pca: Logical. Should the prcomp object be returned? If TRUE, the function returns a list with pca = the prcomp object and plot = the plot. If false, only the plot is returned as a ggplot2 object.
+* use_irlba: Logical. Should the principal components be calculated using prcomp_irlba? Using irlba ignificantly increases speed for large datasets.
+* color, size and shape: Each a data.frame with one column containing the respective values to plot. For colors, numeric values are plotted on a continuous scale, factors as discrete colors. Note that the rownames of the data.frame have to  be the same as the rownames of pca, but can be in any order. By default, the column name is used as a label for the color legend. The easiest way of setting any of those values is to use columns in the phenoData of your SCESet, e.g. colors = pData(sce)[,"cluster",drop=F]. 
+* alpha: Between 0 and 1. Transparency of the points.
+* tite: Title of the plot.
+
+```{r}
+my_plot_PCA = function(counts=NULL,pca=NULL, alpha = 0.7, scale_pca = T, center_pca=T,comp=c(1,2),
+                       color=NULL,size=NULL,shape=NULL,return_pca=F,title="PCA",abs_size=2, use_irlba=F){
+  
+  if(is.null(counts)&is.null(pca)){
+    message('Please provide either a count matrix or pre-computed 
+            principal component analysis as a prcomp object.')
+  } else  if(is.null(pca)){
+    if(use_irlba){
+      library(irlba)
+      if(packageDescription("irlba")$Version <= 2.3){
+        stop("Please update irlba to version 2.3.2 (github). There is a bug in versions < 2.3 which results in unreliable output.")
+      }
+      pca = prcomp_irlba(t(counts),n=max(comp),center=center_pca,scale. = scale_pca)
+      rownames(pca$x) = colnames(counts)} else{
+        pca<-prcomp(t(counts), scale = scale_pca, center = center_pca)}
+  } 
+  
+  pca_1.2<-cbind(pca$x[,comp[1]],pca$x[,comp[2]])
+  
+  if(!use_irlba){
+    sdev1<-round((pca$sdev[comp[1]]**2)/sum(pca$sdev **2)*100,2)
+    sdev2<-round((pca$sdev[comp[2]]**2)/sum(pca$sdev **2)*100,2)
+  } 
+  
+  pca_1.2 = data.table(pca_1.2)
+  names(pca_1.2) = paste0("PC",comp)
+  
+  if(!is.null(color)){
+    pca_1.2[,color:=color[rownames(pca$x),]]
+    setnames(pca_1.2,"color",colnames(color))
+    color = colnames(color)
+  }
+  
+  if(!is.null(size)){
+    pca_1.2[,size:=size[rownames(pca$x),]]
+    setnames(pca_1.2, "size", colnames(size))
+    size = colnames(size)
+  }
+  
+  if(!is.null(shape)){
+    pca_1.2[,shape:=shape[rownames(pca$x),]]
+    setnames(pca_1.2, "shape", colnames(shape))
+    shape = colnames(shape)
+  }
+  
+  p = generic_scatterplot(pca_1.2, x_col = paste0("PC",comp[1]), y_col = paste0("PC",comp[2]), color = color,
+                          size = size, shape = shape, abs_size = abs_size, alpha = alpha)
+  if(use_irlba){p = p+ggtitle(title)} else {
+    p = p + xlab(paste("PC ",comp[1], " [",sdev1, "%]",sep="")) +
+      ylab(paste("PC ", comp[2], " [",sdev2, "%]",sep="")) + ggtitle(title)
+  }
+  
+  if(return_pca){
+    return(list(plot = p, pca = pca))
+  } else{
+    return(p)
+  }
+  
+}
+
+```
+
+#### Visualize PC loadings
+
+Input:
+
+* pca: a prcomp object
+* comp: which principal component to plot 
+
+```{r}
+plot_pca_loadings = function(pca, comp = 1){
+  
+  loading_dt = data.table(pca$rotation[,comp])
+  names(loading_dt) = "loading"
+  loading_dt[,gene_id:=rownames(pca$rotation)]
+  loading_dt = loading_dt[order(loading,decreasing=T)]
+  
+  n = length(loading_dt$loading)
+  loading_dt = loading_dt[append(c(1:15),seq(n-15,n,1)),]
+  
+  loading_dt$gene_id = factor(loading_dt$gene_id, levels = loading_dt$gene_id)
+  
+  p = ggplot(loading_dt, aes(x=loading, y=gene_id))+
+    geom_point()+theme_bw()
+  
+  return(p)
+}
+
+```
+
+
+#### tSNE plot
+Pretty much the same as the PCA plot function, but makes a tSNE map instead.
+
+Input:
+
+* counts: A matrix of log2 transformed, raw or normalized counts or a distance matrix. If a distance is used, is_distance has to be set to TRUE. If no values are provided, a pre-computed Rtsne object has to be provided instead.
+* tsne: Rtsne object. A result from a previous tSNE calculation. If missing, a new tSNE is calculated.
+* return_tsne: Logical. Should the Rtsne object be returned? If TRUE, the function returns a list with tsne = the Rtsne object and plot = the plot. If false, only the plot is returned as a ggplot2 object.
+* is_distance: Logical. Is the input for Rtsne a distance matrix?
+* scale_pca: Logical. Should the data be scaled to have unit variance? Default = FALSE.
+* n_comp: Number of principal components used by tSNE.
+* color, size and shape: Each a data.frame with one column containing the respective values to plot. For colors, numeric values are plotted on a continuous scale, factors as discrete colors. Note that the rownames of the data.frame have to  be the same as the rownames of pca, but can be in any order. By default, the column name is used as a label for the color legend. The easiest way of setting any of those values is to use columns in the phenoData of your SCESet, e.g. colors = pData(sce)[,"cluster",drop=F]. 
+* alpha: Between 0 and 1. Transparency of the plotted points.
+* tite: Title of the plot.
+* show_proportions: Logical. if the plot is colored by a dsicrete variable, should the proprtions of points per color be shown in the legend?
+
+```{r}
+my_plot_tSNE = function(counts=NULL,tsne=NULL,alpha = 0.7, color=NULL,abs_size = 2,
+                        size=NULL,shape=NULL,return_tsne=F,is_distance=F,show_proportions=F,
+                        n_comp = 50, scale_pca=F, use_irlba = F, title="tSNE"){
+  
+  if(is.null(counts)&is.null(tsne)){
+    message('Please provide either a count matrix or pre-computed 
+            tSNE map as an Rtsne object.')
+  } else  if(is.null(tsne)){
+    if(use_irlba){
+      library(irlba)
+      if(packageDescription("irlba")$Version <= 2.3){
+        stop("Please update irlba to version 2.3.2 (github). There is a bug in versions < 2.3 which results in unreliable output.")
+      }
+      pca = prcomp_irlba(t(counts),n=n_comp,center=T,scale. = scale_pca)
+      rownames(pca$x) = colnames(counts)
+      tsne = Rtsne(pca$x,pca = F, initial_dims = n_comp, is_distance = F)
+      rownames(tsne$Y) = colnames(counts)
+    } else{
+      tsne<-Rtsne(t(counts),initial_dims=n_comp,pca=T,
+                  is_distance=is_distance,pca_scale=scale_pca)
+      rownames(tsne$Y) = colnames(counts)
+    }
+  } 
+  
+  tsne_1.2 = data.table(tsne$Y)
+  names(tsne_1.2) = c("tSNE1","tSNE2")
+  
+  if(!is.null(color)){
+    if(show_proportions){
+      if(is.numeric(color[[colnames(color)]])){stop("Proportions can only be calculated for discrete variables. Please provide your color scale as character or factor.")}
+      color[[colnames(color)]] = paste0(color[[colnames(color)]]," [",
+                                        round(calc_percentage(color[[colnames(color)]]),2),"%]")
+    }
+    tsne_1.2[,color:= color[rownames(tsne$Y),]]
+    setnames(tsne_1.2,"color",colnames(color))
+    color = colnames(color)
+  }
+  
+  if(!is.null(size)){
+    tsne_1.2[,size:=size[rownames(tsne$Y),]]
+    setnames(tsne_1.2, "size", colnames(size))
+    size = colnames(size)
+  }
+  
+  if(!is.null(shape)){
+    tsne_1.2[,shape:=shape[rownames(tsne$Y),]]
+    setnames(tsne_1.2, "shape", colnames(shape))
+    shape = colnames(shape)
+  }
+  
+  p = generic_scatterplot(tsne_1.2, x_col = "tSNE1", y_col = "tSNE2", color = color,
+                          size = size, shape = shape, abs_size = abs_size, alpha = alpha)
+  p = p+ggtitle(title)
+  
+  if(return_tsne){
+    return(list(plot = p, tsne = tsne))
+  } else{
+    return(p)
+  }
+  
+  }
+
+```
+
+#### Make a pairs plot
+This function takes a matrix as input, plots each column against all other columns, makes a histogram for each column and calculates the correlations between all columns. Please don't try to plot more than 10 columns this way...
+```{r}
+make_pairs_plot = function(input_mat,main=""){
+  ## puts histograms on the diagonal
+  panel.hist <- function(x, ...)
+  {
+    usr <- par("usr"); on.exit(par(usr))
+    par(usr = c(usr[1:2], 0, 1.5) )
+    h <- hist(x, plot = FALSE)
+    breaks <- h$breaks; nB <- length(breaks)
+    y <- h$counts; y <- y/max(y)
+    rect(breaks[-nB], 0, breaks[-1], y, 
+         col = "lightgray", ...)
+  }
+  
+  ## put (absolute) correlations on the upper panels,
+  ## with size proportional to the correlations.
+  
+  panel.cor <- function(x, y, digits = 2, 
+                        prefix = "", cex.cor, ...)
+  {
+    usr <- par("usr"); on.exit(par(usr))
+    par(usr = c(0, 1, 0, 1))
+    r <- abs(cor(x, y,use="na.or.complete"))
+    txt <- format(c(r, 0.123456789), digits = digits)[1]
+    txt <- paste0(prefix, txt)
+    if(missing(cex.cor)) cex.cor <- 0.8/strwidth(txt)
+    text(0.5, 0.5, txt, cex = cex.cor * r)
+  }
+  pairs(input_mat,upper.panel=panel.cor,diag.panel=panel.hist,main=main)
+}
+```
+
+#### Plotting multiple ggplots on one page
+The function is taken from the r-cookbook website and can be found [here](http://www.cookbook-r.com/Graphs/Multiple_graphs_on_one_page_(ggplot2)/)
+
+```{r}
+ggmultiplot = function(..., plotlist=NULL, file, cols=1, layout=NULL) {
+  library(grid)
+  
+  # Make a list from the ... arguments and plotlist
+  plots <- c(list(...), plotlist)
+  
+  numPlots = length(plots)
+  
+  # If layout is NULL, then use 'cols' to determine layout
+  if (is.null(layout)) {
+    # Make the panel
+    # ncol: Number of columns of plots
+    # nrow: Number of rows needed, calculated from # of cols
+    layout <- matrix(seq(1, cols * ceiling(numPlots/cols)),
+                     ncol = cols, nrow = ceiling(numPlots/cols))
+  }
+  
+  if (numPlots==1) {
+    print(plots[[1]])
+    
+  } else {
+    # Set up the page
+    grid.newpage()
+    pushViewport(viewport(layout = grid.layout(nrow(layout), ncol(layout))))
+    
+    # Make each plot, in the correct location
+    for (i in 1:numPlots) {
+      # Get the i,j matrix positions of the regions that contain this subplot
+      matchidx <- as.data.frame(which(layout == i, arr.ind = TRUE))
+      
+      print(plots[[i]], vp = viewport(layout.pos.row = matchidx$row,
+                                      layout.pos.col = matchidx$col))
+    }
+  }
+}
+```
+
+## Session Info
+```{r}
+sessionInfo()
+```
