@@ -13,6 +13,7 @@ The main steps included are:
 * Detection of rare cell subtypes with CellSIUS 
 * Visualization
 
+[![DOI](https://zenodo.org/badge/189391647.svg)](https://zenodo.org/badge/latestdoi/189391647)
 
 ### How do I get set up? ###
 
